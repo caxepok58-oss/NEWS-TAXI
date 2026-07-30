@@ -101,6 +101,39 @@ def test_feed_topic_used_when_keywords_silent():
     assert topic == TOPIC_AUTO
 
 
+def test_search_feed_topic_is_not_trusted_blindly():
+    """Поиск возвращает что угодно похожее — от него требуем совпадения слов."""
+    search_feed = Feed("Поиск", "https://x", topic=TOPIC_AUTO, tier="fallback")
+    topic, _ = fetcher.classify("суд рассмотрит спор двух компаний", search_feed)
+    assert topic is None
+
+    topic, _ = fetcher.classify("продажи автомобилей выросли", search_feed)
+    assert topic == TOPIC_AUTO
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "в воронежской области автомобиль столкнулся с локомотивом",
+        "на урале в дтп погиб подросток",
+        "в москве сгорел автомобиль на парковке",
+    ],
+)
+def test_incidents_outside_penza_do_not_leak_into_auto(text):
+    """Чужое ДТП — не новость авторынка и не наша рубрика происшествий."""
+    topic, _ = fetcher.classify(text, Feed("Тест", "https://x"))
+    assert topic is None
+
+
+def test_market_news_survives_incident_words():
+    """Отзыв партии машин — новость рынка, хотя в тексте есть слово «аварий»."""
+    topic, _ = fetcher.classify(
+        "отзыв автомобилей lada после аварий: завод меняет тормоза",
+        Feed("Тест", "https://x"),
+    )
+    assert topic == TOPIC_AUTO
+
+
 # --------------------------------------------------------------------------- #
 # Рейтинг
 # --------------------------------------------------------------------------- #
@@ -244,10 +277,12 @@ def test_fetch_feed_parses_and_filters(monkeypatch):
             return None
 
     monkeypatch.setattr(fetcher.requests, "get", lambda *a, **k: FakeResponse())
-    articles = fetcher._fetch_feed(Feed("Тест", "https://x", region="penza"))
+    result = fetcher._fetch_feed(Feed("Тест", "https://x", region="penza"))
 
-    assert len(articles) == 1, "нерелевантная новость должна отсеяться"
-    article = articles[0]
+    assert result.entries_total == 2
+    assert not result.broken
+    assert len(result.articles) == 1, "нерелевантная новость должна отсеяться"
+    article = result.articles[0]
     assert article.topic == TOPIC_TAXI
     assert article.is_penza
     assert article.image_url == "https://penzaobzor.ru/img/1.jpg"
@@ -267,20 +302,26 @@ def test_collect_end_to_end(monkeypatch, conn):
     monkeypatch.setattr(fetcher, "FEEDS", (Feed("Тест", "https://x", region="penza"),))
     monkeypatch.setattr(fetcher, "FALLBACK_FEEDS", ())
 
-    candidates = fetcher.collect(conn, min_items=1, limit=20, max_age_hours=10**6)
-    assert len(candidates) == 1
-    assert candidates[0].topic == TOPIC_TAXI
+    result = fetcher.collect(conn, min_items=1, limit=20, max_age_hours=10**6)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].topic == TOPIC_TAXI
 
     # После публикации та же новость больше не возвращается.
-    fetcher.mark_published(conn, candidates)
-    assert fetcher.collect(conn, min_items=1, limit=20, max_age_hours=10**6) == []
+    fetcher.mark_published(conn, result.candidates)
+    assert fetcher.collect(conn, min_items=1, limit=20, max_age_hours=10**6).candidates == []
+
+
+def _feed_results(articles, tier: str = "primary"):
+    """Ответ fetch_feeds: одна лента со всеми переданными новостями."""
+    feed = Feed("Тест", "https://x", tier=tier)
+    return [fetcher.FeedResult(feed, articles=list(articles), entries_total=len(articles))]
 
 
 def test_collect_respects_limit(monkeypatch, conn, article_factory):
     many = [article_factory(title=f"Авто {i}", topic=TOPIC_AUTO) for i in range(30)]
-    monkeypatch.setattr(fetcher, "fetch_feeds", lambda feeds, **kw: list(many))
+    monkeypatch.setattr(fetcher, "fetch_feeds", lambda feeds, **kw: _feed_results(many))
     monkeypatch.setattr(fetcher, "FALLBACK_FEEDS", ())
-    assert len(fetcher.collect(conn, min_items=5, limit=12)) == 12
+    assert len(fetcher.collect(conn, min_items=5, limit=12).candidates) == 12
 
 
 def test_collect_uses_fallback_when_topic_missing(monkeypatch, conn, article_factory):
@@ -292,14 +333,211 @@ def test_collect_uses_fallback_when_topic_missing(monkeypatch, conn, article_fac
     def fake_fetch(feeds, **kwargs):
         feeds = list(feeds)
         used_feeds.extend(feeds)
-        return list(primary) if feeds and feeds[0].tier == "primary" else list(extra)
+        if feeds and feeds[0].tier == "primary":
+            return _feed_results(primary)
+        return _feed_results(extra, tier="fallback")
 
     monkeypatch.setattr(fetcher, "fetch_feeds", fake_fetch)
-    candidates = fetcher.collect(conn, min_items=5, limit=20)
+    result = fetcher.collect(conn, min_items=5, limit=20)
 
     assert any(f.tier == "fallback" for f in used_feeds), "поиск не подключился"
     assert {f.topic for f in used_feeds if f.tier == "fallback"} == {TOPIC_TAXI, TOPIC_INCIDENT}
-    assert any(a.topic == TOPIC_TAXI for a in candidates)
+    assert any(a.topic == TOPIC_TAXI for a in result.candidates)
+
+
+# --------------------------------------------------------------------------- #
+# Дедупликация сюжетов между выпусками
+# --------------------------------------------------------------------------- #
+
+
+def test_known_story_is_filtered_across_runs(monkeypatch, conn, article_factory):
+    """Вчерашний сюжет, переписанный другим изданием, не должен пройти снова."""
+    yesterday = article_factory(
+        title="Пожар на складе Wildberries под Пензой локализован",
+        url="https://a.ru/1",
+        source="Издание А",
+    )
+    fetcher.mark_published(conn, [yesterday])
+
+    today = article_factory(
+        title="Для тушения пожара на складе Wildberries прибыл вертолет МЧС",
+        url="https://b.ru/2",
+        source="Издание Б",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+    )
+    assert not fetcher.is_published(conn, today), "хэши разные — точная проверка не поймает"
+    assert fetcher.is_known_story(today, fetcher.recent_titles(conn))
+
+    monkeypatch.setattr(fetcher, "fetch_feeds", lambda feeds, **kw: _feed_results([today]))
+    monkeypatch.setattr(fetcher, "FALLBACK_FEEDS", ())
+    assert fetcher.collect(conn, min_items=1, limit=20).candidates == []
+
+
+def test_unrelated_news_passes_story_dedup(conn, article_factory):
+    fetcher.mark_published(conn, [article_factory(title="Пожар на складе под Пензой")])
+    other = article_factory(title="В Пензе подорожал проезд в маршрутках")
+    assert not fetcher.is_known_story(other, fetcher.recent_titles(conn))
+
+
+def test_recent_titles_respects_window(conn, article_factory):
+    fetcher.mark_published(conn, [article_factory(title="Старая новость")])
+    assert fetcher.recent_titles(conn, days=3) == ["Старая новость"]
+    assert fetcher.recent_titles(conn, days=0) == []
+
+
+# --------------------------------------------------------------------------- #
+# Лимит на источник
+# --------------------------------------------------------------------------- #
+
+
+def test_limit_per_source_trims_and_backfills(article_factory):
+    selected = [
+        article_factory(title=f"АвтоСтат {i}", source="АвтоСтат", topic=TOPIC_AUTO)
+        for i in range(4)
+    ]
+    pool = selected + [
+        article_factory(title="Колёса", source="Kolesa.ru", topic=TOPIC_AUTO),
+        article_factory(title="Пять колёс", source="5 колесо", topic=TOPIC_AUTO),
+    ]
+    result = fetcher.limit_per_source(selected, pool, max_per_source=2)
+
+    assert len(result) == len(selected), "выпуск не должен худеть"
+    assert sum(1 for a in result if a.source == "АвтоСтат") == 2
+    assert {a.source for a in result} == {"АвтоСтат", "Kolesa.ru", "5 колесо"}
+
+
+def test_limit_per_source_without_replacements(article_factory):
+    selected = [
+        article_factory(title=f"АвтоСтат {i}", source="АвтоСтат", topic=TOPIC_AUTO)
+        for i in range(4)
+    ]
+    result = fetcher.limit_per_source(selected, [], max_per_source=2)
+    assert len(result) == 2
+
+
+def test_limit_per_source_disabled(article_factory):
+    selected = [article_factory(title=f"N{i}", source="Один") for i in range(5)]
+    assert len(fetcher.limit_per_source(selected, [], max_per_source=0)) == 5
+
+
+# --------------------------------------------------------------------------- #
+# Здоровье лент
+# --------------------------------------------------------------------------- #
+
+
+def test_feed_health_alerts_after_threshold(conn, monkeypatch):
+    monkeypatch.setattr(fetcher, "FEED_ALERT_AFTER", 3)
+    broken = fetcher.FeedResult(Feed("Сломанная", "https://x"), error="404")
+
+    assert fetcher.record_feed_health(conn, [broken]) == []
+    assert fetcher.record_feed_health(conn, [broken]) == []
+    alerts = fetcher.record_feed_health(conn, [broken])
+    assert [name for name, _, _ in alerts] == ["Сломанная"]
+
+    # Повторно о той же ленте не сообщаем.
+    assert fetcher.record_feed_health(conn, [broken]) == []
+
+
+def test_feed_health_resets_after_recovery(conn, monkeypatch, article_factory):
+    monkeypatch.setattr(fetcher, "FEED_ALERT_AFTER", 2)
+    feed = Feed("Лента", "https://x")
+    broken = fetcher.FeedResult(feed, error="500")
+    healthy = fetcher.FeedResult(feed, articles=[article_factory()], entries_total=5)
+
+    fetcher.record_feed_health(conn, [broken])
+    assert fetcher.record_feed_health(conn, [broken])  # предупредили
+    fetcher.record_feed_health(conn, [healthy])
+
+    health = {row["name"]: row for row in fetcher.feed_health(conn)}
+    assert health["Лента"]["broken_streak"] == 0
+    assert health["Лента"]["alerted_at"] is None
+
+    # Сломалась снова — предупреждаем заново.
+    fetcher.record_feed_health(conn, [broken])
+    assert fetcher.record_feed_health(conn, [broken])
+
+
+def test_empty_feed_counts_as_broken_but_irrelevant_news_does_not(conn):
+    feed = Feed("Лента", "https://x")
+    assert fetcher.FeedResult(feed, entries_total=0).broken
+    # Записи есть, но ни одна не по нашим темам — это нормально.
+    assert not fetcher.FeedResult(feed, articles=[], entries_total=20).broken
+
+
+# --------------------------------------------------------------------------- #
+# Срочные новости
+# --------------------------------------------------------------------------- #
+
+
+def test_breaking_detects_severe_incident(article_factory, now):
+    from datetime import timedelta as td
+
+    severe = article_factory(
+        title="В Пензе при взрыве газа погиб человек",
+        summary="Идёт эвакуация жильцов.",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+        published=now - td(hours=1),
+    )
+    routine = article_factory(
+        title="В Пензе на улице Ленина столкнулись две легковушки",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+        published=now - td(hours=1),
+    )
+    urgent = fetcher.find_breaking([severe, routine])
+    assert [a.title for a in urgent] == [severe.title]
+
+
+def test_breaking_detects_multi_source_story(article_factory, now):
+    from datetime import timedelta as td
+
+    first = article_factory(
+        title="Крупная авария на проспекте Строителей в Пензе",
+        source="Издание А",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+        published=now - td(hours=1),
+    )
+    second = article_factory(
+        title="Авария на проспекте Строителей в Пензе собрала пробку",
+        source="Издание Б",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+        published=now - td(hours=1),
+    )
+    assert fetcher.find_breaking([first, second], min_sources=2)
+
+
+def test_breaking_ignores_stale_and_non_penza(article_factory, now):
+    from datetime import timedelta as td
+
+    stale = article_factory(
+        title="В Пензе при взрыве газа погиб человек",
+        topic=TOPIC_INCIDENT,
+        is_penza=True,
+        published=now - td(hours=20),
+    )
+    elsewhere = article_factory(
+        title="В Самаре при взрыве газа погиб человек",
+        topic=TOPIC_INCIDENT,
+        is_penza=False,
+        published=now - td(hours=1),
+    )
+    assert fetcher.find_breaking([stale, elsewhere]) == []
+
+
+def test_breaking_ignores_auto_topic(article_factory, now):
+    from datetime import timedelta as td
+
+    article = article_factory(
+        title="Массово отзывают автомобили в Пензе",
+        topic=TOPIC_AUTO,
+        is_penza=True,
+        published=now - td(hours=1),
+    )
+    assert fetcher.find_breaking([article]) == []
 
 
 def test_fetch_feed_survives_network_error(monkeypatch):
@@ -307,4 +545,6 @@ def test_fetch_feed_survives_network_error(monkeypatch):
         raise fetcher.requests.RequestException("нет сети")
 
     monkeypatch.setattr(fetcher.requests, "get", boom)
-    assert fetcher._fetch_feed(Feed("Тест", "https://x")) == []
+    result = fetcher._fetch_feed(Feed("Тест", "https://x"))
+    assert result.articles == []
+    assert result.broken and "нет сети" in result.error

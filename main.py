@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -45,9 +45,22 @@ MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "36"))
 # Сколько кандидатов уходит модели на финальный отбор.
 CANDIDATE_LIMIT = int(os.getenv("CANDIDATE_LIMIT", "20"))
+# Не больше стольких заметок от одного издания в выпуске.
+MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "2"))
 # Повтор после неудачного планового прогона.
 RETRY_MINUTES = int(os.getenv("RETRY_MINUTES", "30"))
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "2"))
+# Закреплять утренний дайджест в чате (нужны права администратора).
+PIN_DIGEST = os.getenv("PIN_DIGEST", "1") not in ("0", "false", "False", "")
+
+# --- Срочные новости ------------------------------------------------------
+BREAKING_ENABLED = os.getenv("BREAKING_ENABLED", "1") not in ("0", "false", "False", "")
+BREAKING_EVERY_HOURS = int(os.getenv("BREAKING_EVERY_HOURS", "2"))
+BREAKING_MAX_AGE_HOURS = int(os.getenv("BREAKING_MAX_AGE_HOURS", "4"))
+BREAKING_MAX_PER_DAY = int(os.getenv("BREAKING_MAX_PER_DAY", "2"))
+# Окно, в котором разрешено выходить вне расписания (по TIMEZONE).
+BREAKING_FROM_HOUR = int(os.getenv("BREAKING_FROM_HOUR", "9"))
+BREAKING_TO_HOUR = int(os.getenv("BREAKING_TO_HOUR", "21"))
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 ADMIN_USER_IDS = {
@@ -133,37 +146,49 @@ class RunResult:
     retryable: bool = False
 
 
-def _build_digest_blocking() -> tuple[summarizer.Digest, bytes | None] | None:
-    """Синхронная часть прогона. None — если публиковать нечего.
+@dataclass
+class BuildResult:
+    """Собранный выпуск и замечания к лентам, накопленные по пути."""
 
-    Порядок: сбор кандидатов -> отбор моделью -> дочитывание статей ->
-    пересказ -> картинка. Выполняется в отдельном потоке, чтобы не
-    блокировать event loop бота.
+    digest: summarizer.Digest | None = None
+    image: bytes | None = None
+    feed_alerts: list[tuple[str, int, str]] = field(default_factory=list)
+
+
+def _build_digest_blocking() -> BuildResult:
+    """Синхронная часть прогона. digest=None — если публиковать нечего.
+
+    Порядок: сбор кандидатов -> отбор моделью -> ограничение по источникам ->
+    дочитывание статей -> пересказ -> картинка. Выполняется в отдельном
+    потоке, чтобы не блокировать event loop бота.
     """
     conn = fetcher.connect()
     try:
         fetcher.purge_old(conn)
-        candidates = fetcher.collect(
+        collected = fetcher.collect(
             conn,
             min_items=MIN_ITEMS,
             limit=CANDIDATE_LIMIT,
             max_age_hours=MAX_AGE_HOURS,
         )
+        candidates = collected.candidates
+        alerts = collected.feed_alerts
         if not candidates:
             fetcher.log_run(conn, "empty", 0, "нет новых новостей")
-            return None
+            return BuildResult(feed_alerts=alerts)
 
         selected = summarizer.select_best(
             candidates, min_items=MIN_ITEMS, max_items=MAX_ITEMS
         )
+        selected = fetcher.limit_per_source(selected, candidates, MAX_PER_SOURCE)
         if not selected:
             fetcher.log_run(conn, "empty", 0, "модель не отобрала ни одной новости")
-            return None
+            return BuildResult(feed_alerts=alerts)
 
         extractor.enrich(selected)
         digest = summarizer.build_digest(selected)
         image = imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
-        return digest, image
+        return BuildResult(digest=digest, image=image, feed_alerts=alerts)
     finally:
         conn.close()
 
@@ -197,12 +222,19 @@ async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> 
             await asyncio.to_thread(_mark_blocking, [], "error", repr(exc))
             return RunResult(False, f"ошибка сборки: {exc}", retryable=True)
 
-        if result is None:
+        if result.feed_alerts and bot is not None:
+            lines = "\n".join(
+                f"• {name}: {streak} прогонов подряд, {reason}"
+                for name, streak, reason in result.feed_alerts
+            )
+            await notify_admins(bot, f"⚠️ Ленты не отвечают:\n{lines}")
+
+        if result.digest is None:
             log.info("Новых новостей нет — публиковать нечего")
             # Это штатная ситуация, а не сбой: повторять и будить админов незачем.
             return RunResult(True, "свежих новостей не нашлось, дайджест не отправлен")
 
-        digest, image = result
+        digest, image = result.digest, result.image
         if dry_run:
             print(digest.text)
             if image:
@@ -219,7 +251,14 @@ async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> 
             )
 
         try:
-            await sender.send_digest(bot, chat_id, digest.text, image=image)
+            await sender.send_digest(
+                bot,
+                chat_id,
+                digest.text,
+                image=image,
+                buttons=digest.buttons,
+                pin=PIN_DIGEST,
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось отправить дайджест")
             await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
@@ -232,6 +271,69 @@ async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> 
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         log.info("=== Готово: %d новостей за %.1f с ===", len(digest.articles), elapsed)
         return RunResult(True, f"дайджест отправлен: {len(digest.articles)} новостей")
+
+
+def _breaking_blocking() -> tuple[summarizer.Digest, bytes | None] | None:
+    """Ищет новость, ради которой стоит выйти вне расписания."""
+    conn = fetcher.connect()
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        already = conn.execute(
+            "SELECT COUNT(*) AS c FROM runs WHERE status = 'breaking' AND started_at >= ?",
+            (today,),
+        ).fetchone()["c"]
+        if already >= BREAKING_MAX_PER_DAY:
+            log.info("Лимит срочных постов на сегодня исчерпан (%d)", already)
+            return None
+
+        collected = fetcher.collect(
+            conn,
+            min_items=1,
+            limit=CANDIDATE_LIMIT,
+            max_age_hours=BREAKING_MAX_AGE_HOURS,
+        )
+        urgent = fetcher.find_breaking(
+            collected.candidates, max_age_hours=BREAKING_MAX_AGE_HOURS
+        )
+        if not urgent:
+            return None
+
+        log.info("Найдена срочная новость: %s", urgent[0].title[:90])
+        extractor.enrich(urgent[:1])
+        digest = summarizer.build_digest(urgent[:1])
+        image = imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
+        return digest, image
+    finally:
+        conn.close()
+
+
+async def run_breaking(bot: Bot, chat_id: str | int) -> RunResult:
+    """Проверяет ленты между выпусками и публикует срочную новость."""
+    if _run_lock.locked():
+        return RunResult(True, "основной прогон занят, проверку пропускаю")
+
+    async with _run_lock:
+        try:
+            found = await asyncio.to_thread(_breaking_blocking)
+        except Exception as exc:  # noqa: BLE001 - фоновая проверка не критична
+            log.exception("Ошибка при поиске срочных новостей")
+            return RunResult(False, f"проверка срочных новостей не удалась: {exc}")
+
+        if found is None:
+            return RunResult(True, "срочных новостей нет")
+
+        digest, image = found
+        try:
+            await sender.send_digest(
+                bot, chat_id, digest.text, image=image, buttons=digest.buttons
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Не удалось отправить срочную новость")
+            return RunResult(False, f"срочная новость не отправлена: {exc}")
+
+        await asyncio.to_thread(_mark_blocking, digest.articles, "breaking")
+        log.info("Опубликована срочная новость")
+        return RunResult(True, "опубликована срочная новость")
 
 
 async def notify_admins(bot: Bot, text: str) -> None:
@@ -361,6 +463,16 @@ async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     await notify_admins(context.bot, f"⚠️ Дайджест не вышел: {result.message}. {tail}")
 
 
+async def scheduled_breaking(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверка срочных новостей между выпусками — только в дневном окне."""
+    hour = datetime.now(digest_time().tzinfo).hour
+    if not BREAKING_FROM_HOUR <= hour < BREAKING_TO_HOUR:
+        log.debug("Вне окна срочных новостей (%d ч) — пропускаю", hour)
+        return
+    result = await run_breaking(context.bot, CHAT_ID)
+    log.info("Проверка срочных новостей: %s", result.message)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Ошибка в обработчике", exc_info=context.error)
 
@@ -387,8 +499,24 @@ def run_bot() -> None:
             'pip install "python-telegram-bot[job-queue]"'
         )
     application.job_queue.run_daily(scheduled_digest, time=digest_time(), name="daily-digest")
-
     log.info("Бот запущен. Дайджест ежедневно в %s (%s)", DIGEST_TIME, TIMEZONE)
+
+    if BREAKING_ENABLED and BREAKING_EVERY_HOURS > 0:
+        application.job_queue.run_repeating(
+            scheduled_breaking,
+            interval=timedelta(hours=BREAKING_EVERY_HOURS),
+            first=timedelta(minutes=5),
+            name="breaking-check",
+        )
+        log.info(
+            "Проверка срочных новостей: раз в %d ч, окно %02d:00–%02d:00, "
+            "не более %d постов в сутки",
+            BREAKING_EVERY_HOURS,
+            BREAKING_FROM_HOUR,
+            BREAKING_TO_HOUR,
+            BREAKING_MAX_PER_DAY,
+        )
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
@@ -407,6 +535,42 @@ async def run_once(dry_run: bool = False) -> int:
     return 0 if result.ok else 1
 
 
+def check_feeds() -> int:
+    """Разовая проверка всех лент: адрес, число записей, ошибка."""
+    all_feeds = list(fetcher.FEEDS) + list(fetcher.FALLBACK_FEEDS)
+    results = fetcher.fetch_feeds(all_feeds)
+
+    name_width = max(len(r.feed.name) for r in results)
+    broken = 0
+    print(f"\n{'ЛЕНТА'.ljust(name_width)}  ЗАПИСЕЙ  ПОДХОДИТ  СОСТОЯНИЕ")
+    print("-" * (name_width + 34))
+    for result in sorted(results, key=lambda r: (not r.broken, r.feed.name)):
+        state = "OK"
+        if result.error:
+            state = f"ОШИБКА: {result.error[:60]}"
+            broken += 1
+        elif result.entries_total == 0:
+            state = "ПУСТО — проверьте адрес"
+            broken += 1
+        print(
+            f"{result.feed.name.ljust(name_width)}  "
+            f"{result.entries_total:>7}  {len(result.articles):>8}  {state}"
+        )
+
+    print(f"\nВсего лент: {len(results)}, с проблемами: {broken}")
+    if not broken:
+        print("Все ленты отвечают.")
+
+    # Заодно обновляем статистику, чтобы бот не слал предупреждение
+    # о ленте, которую вы только что починили.
+    conn = fetcher.connect()
+    try:
+        fetcher.record_feed_health(conn, results)
+    finally:
+        conn.close()
+    return 1 if broken else 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Telegram-бот новостного дайджеста")
     parser.add_argument(
@@ -415,9 +579,14 @@ def main() -> None:
     parser.add_argument(
         "--dry-run", action="store_true", help="собрать и напечатать пост, ничего не отправляя"
     )
+    parser.add_argument(
+        "--check-feeds", action="store_true", help="проверить доступность всех лент и выйти"
+    )
     args = parser.parse_args()
 
     setup_logging()
+    if args.check_feeds:
+        raise SystemExit(check_feeds())
     if args.dry_run:
         raise SystemExit(asyncio.run(run_once(dry_run=True)))
     if args.once:

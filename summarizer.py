@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 from typing import Sequence
 
@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "4000"))
+# buttons — ссылки уходят в inline-кнопки под постом, текст остаётся чистым;
+# inline  — ссылка строкой под каждой новостью.
+LINKS_MODE = os.getenv("LINKS_MODE", "buttons").strip().lower()
 
 # --------------------------------------------------------------------------- #
 # Промпты и схемы
@@ -311,8 +314,15 @@ def request_digest(
 # --------------------------------------------------------------------------- #
 
 
-def render(data: dict, articles: Sequence[Article]) -> str:
-    """Собирает HTML-пост для Telegram: тексты от модели + наши ссылки."""
+def render(
+    data: dict, articles: Sequence[Article], links_mode: str | None = None
+) -> tuple[str, list[tuple[str, str]]]:
+    """Собирает HTML-пост для Telegram: тексты от модели + наши ссылки.
+
+    Возвращает (текст поста, список кнопок «подпись -> ссылка»). В режиме
+    ``inline`` список кнопок пустой, а ссылки стоят строками в тексте.
+    """
+    links_mode = (links_mode or LINKS_MODE).lower()
     by_id = {index: article for index, article in enumerate(articles, start=1)}
     summaries: dict[int, dict] = {}
     for item in data["items"]:
@@ -334,6 +344,7 @@ def render(data: dict, articles: Sequence[Article]) -> str:
         header += f"\n{intro}"
     sections = [header]
 
+    buttons: list[tuple[str, str]] = []
     number = 0
     for topic in TOPIC_ORDER:
         topic_ids = [i for i in sorted(summaries) if by_id[i].topic == topic]
@@ -349,7 +360,15 @@ def render(data: dict, articles: Sequence[Article]) -> str:
             block = f"{number}. <b>{headline}</b>"
             if summary:
                 block += f"\n{summary}"
-            block += f'\n<a href="{escape(article.url, quote=True)}">{escape(article.source)}</a>'
+            if links_mode == "buttons":
+                # Ссылка уедет в кнопку, в тексте оставляем только источник.
+                block += f"\n<i>{escape(article.source)}</i>"
+                buttons.append((f"{number}. {article.source}"[:60], article.url))
+            else:
+                block += (
+                    f'\n<a href="{escape(article.url, quote=True)}">'
+                    f"{escape(article.source)}</a>"
+                )
             blocks.append(block)
         sections.append(f"<b>{escape(TOPIC_TITLES[topic])}</b>\n" + "\n\n".join(blocks))
 
@@ -357,17 +376,18 @@ def render(data: dict, articles: Sequence[Article]) -> str:
     if skipped:
         log.warning("Модель пропустила %d новостей — они не попали в пост", skipped)
 
-    return "\n\n".join(sections).strip()
+    return "\n\n".join(sections).strip(), buttons
 
 
 @dataclass
 class Digest:
-    """Готовый выпуск: текст поста, вошедшие новости и данные для обложки."""
+    """Готовый выпуск: текст поста, кнопки, вошедшие новости и данные обложки."""
 
     text: str
     articles: list[Article]
     title: str
     image_prompt: str = ""
+    buttons: list[tuple[str, str]] = field(default_factory=list)
 
 
 def build_digest(
@@ -378,7 +398,7 @@ def build_digest(
         raise SummarizerError("Нет новостей для дайджеста")
 
     data = request_digest(articles, client=client)
-    text = render(data, articles)
+    text, buttons = render(data, articles)
 
     used_ids = {
         int(item["id"])
@@ -391,4 +411,5 @@ def build_digest(
         articles=used or list(articles),
         title=str(data.get("title") or "Новостной дайджест").strip(),
         image_prompt=str(data.get("image_prompt") or "").strip(),
+        buttons=buttons,
     )

@@ -7,11 +7,14 @@ import logging
 import re
 from typing import Iterable, Sequence
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 log = logging.getLogger(__name__)
+
+# Сколько кнопок ставить в один ряд.
+BUTTONS_PER_ROW = 2
 
 # Лимит Telegram — 4096 символов на сообщение и 1024 на подпись к фото;
 # берём с запасом.
@@ -75,16 +78,33 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
-async def _send_one(bot: Bot, chat_id: str | int, text: str) -> None:
+def build_keyboard(buttons: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup | None:
+    """Собирает клавиатуру со ссылками на источники."""
+    if not buttons:
+        return None
+    rows = [
+        [InlineKeyboardButton(text=label, url=url) for label, url in buttons[i : i + BUTTONS_PER_ROW]]
+        for i in range(0, len(buttons), BUTTONS_PER_ROW)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_one(
+    bot: Bot,
+    chat_id: str | int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    """Отправляет одно сообщение. Возвращает объект сообщения или None."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            await bot.send_message(
+            return await bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+                reply_markup=reply_markup,
             )
-            return
         except RetryAfter as exc:
             wait = float(getattr(exc, "retry_after", 5))
             log.warning("Telegram просит подождать %.1f с (попытка %d)", wait, attempt)
@@ -92,12 +112,12 @@ async def _send_one(bot: Bot, chat_id: str | int, text: str) -> None:
         except BadRequest as exc:
             # Чаще всего — невалидный HTML. Отправляем то же самое без разметки.
             log.error("Telegram отклонил сообщение (%s), пробую без HTML", exc)
-            await bot.send_message(
+            return await bot.send_message(
                 chat_id=chat_id,
                 text=_strip_html(text),
                 disable_web_page_preview=True,
+                reply_markup=reply_markup,
             )
-            return
         except TelegramError as exc:
             if attempt == MAX_RETRIES:
                 raise
@@ -106,50 +126,75 @@ async def _send_one(bot: Bot, chat_id: str | int, text: str) -> None:
     raise TelegramError("Не удалось отправить сообщение после нескольких попыток")
 
 
-async def _send_photo(bot: Bot, chat_id: str | int, image: bytes, caption: str) -> bool:
-    """Отправляет фото с подписью. Возвращает False, если не получилось."""
-    try:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=image,
-            caption=caption or None,
-            parse_mode=ParseMode.HTML if caption else None,
-        )
-        return True
-    except RetryAfter as exc:
-        wait = float(getattr(exc, "retry_after", 5))
-        log.warning("Telegram просит подождать %.1f с перед отправкой фото", wait)
-        await asyncio.sleep(wait + 1)
+async def _send_photo(
+    bot: Bot,
+    chat_id: str | int,
+    image: bytes,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    """Отправляет фото с подписью. Возвращает сообщение или None при неудаче."""
+    for attempt in range(1, 3):
         try:
-            await bot.send_photo(
+            return await bot.send_photo(
                 chat_id=chat_id,
                 photo=image,
                 caption=caption or None,
                 parse_mode=ParseMode.HTML if caption else None,
+                reply_markup=reply_markup,
             )
-            return True
-        except TelegramError as exc2:
-            log.error("Фото не отправлено: %s", exc2)
+        except RetryAfter as exc:
+            wait = float(getattr(exc, "retry_after", 5))
+            log.warning("Telegram просит подождать %.1f с перед отправкой фото", wait)
+            await asyncio.sleep(wait + 1)
+        except TelegramError as exc:
+            log.error("Фото не отправлено (%s) — публикую пост без картинки", exc)
+            return None
+    return None
+
+
+async def pin_message(bot: Bot, chat_id: str | int, message_id: int) -> bool:
+    """Закрепляет сообщение. Без прав администратора просто пишет в лог."""
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id, message_id=message_id, disable_notification=True
+        )
+        return True
     except TelegramError as exc:
-        log.error("Фото не отправлено (%s) — публикую пост без картинки", exc)
-    return False
+        log.warning("Не удалось закрепить пост (%s) — нужны права администратора", exc)
+        return False
 
 
 async def send_digest(
-    bot: Bot, chat_id: str | int, text: str, image: bytes | None = None
+    bot: Bot,
+    chat_id: str | int,
+    text: str,
+    image: bytes | None = None,
+    buttons: Sequence[tuple[str, str]] = (),
+    pin: bool = False,
 ) -> int:
     """Отправляет пост (при необходимости — несколькими сообщениями).
 
-    Возвращает количество отправленных сообщений.
+    Клавиатура со ссылками ставится на последнее сообщение, закрепляется —
+    первое (с картинкой, если она есть). Возвращает число сообщений.
     """
+    keyboard = build_keyboard(buttons)
     chunks: Sequence[str]
     sent = 0
+    first_message = None
 
     if image:
         caption, rest = split_for_photo(text)
-        if await _send_photo(bot, chat_id, image, caption):
+        # Если весь пост уместился в подпись, кнопки ставим сразу на фото.
+        message = await _send_photo(
+            bot, chat_id, image, caption, reply_markup=keyboard if not rest else None
+        )
+        if message is not None:
+            first_message = message
             sent += 1
             chunks = rest
+            if not rest:
+                keyboard = None
         else:
             # Картинку отправить не удалось — публикуем полный текст.
             chunks = split_message(text)
@@ -157,10 +202,18 @@ async def send_digest(
         chunks = split_message(text)
 
     for index, chunk in enumerate(chunks, start=1):
-        await _send_one(bot, chat_id, chunk)
+        last = index == len(chunks)
+        message = await _send_one(
+            bot, chat_id, chunk, reply_markup=keyboard if last else None
+        )
+        if first_message is None:
+            first_message = message
         sent += 1
-        if index < len(chunks):
+        if not last:
             await asyncio.sleep(1)  # не упираемся в лимит частоты
+
+    if pin and first_message is not None:
+        await pin_message(bot, chat_id, first_message.message_id)
 
     log.info("Дайджест отправлен в %s (%d сообщ.)", chat_id, sent)
     return sent

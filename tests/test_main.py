@@ -74,7 +74,7 @@ async def test_successful_run_sends_and_marks_published(digest):
     import fetcher
 
     bot = _bot()
-    with patch.object(main, "_build_digest_blocking", return_value=(digest, b"PNG")), patch.object(
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest, b"PNG")), patch.object(
         main.sender, "send_digest", new=AsyncMock(return_value=1)
     ) as send:
         result = await main.run_digest(bot, "-100")
@@ -90,7 +90,7 @@ async def test_successful_run_sends_and_marks_published(digest):
 async def test_send_failure_keeps_news_unpublished(digest):
     import fetcher
 
-    with patch.object(main, "_build_digest_blocking", return_value=(digest, None)), patch.object(
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
         main.sender, "send_digest", new=AsyncMock(side_effect=RuntimeError("нет сети"))
     ):
         result = await main.run_digest(_bot(), "-100")
@@ -105,7 +105,7 @@ async def test_send_failure_keeps_news_unpublished(digest):
 
 @pytest.mark.asyncio
 async def test_no_news_is_not_a_failure():
-    with patch.object(main, "_build_digest_blocking", return_value=None):
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult()):
         result = await main.run_digest(_bot(), "-100")
     assert result.ok and not result.retryable
 
@@ -122,7 +122,7 @@ async def test_summarizer_error_is_retryable():
 @pytest.mark.asyncio
 async def test_dry_run_does_not_send(digest, tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN_IMAGE", str(tmp_path / "preview.png"))
-    with patch.object(main, "_build_digest_blocking", return_value=(digest, b"PNGDATA")), patch.object(
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest, b"PNGDATA")), patch.object(
         main.sender, "send_digest", new=AsyncMock()
     ) as send:
         result = await main.run_digest(None, "-100", dry_run=True)
@@ -196,7 +196,7 @@ async def test_no_news_does_not_wake_admins(monkeypatch):
     monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
     bot = _bot()
     context = _context(bot)
-    with patch.object(main, "_build_digest_blocking", return_value=None):
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult()):
         await main.scheduled_digest(context)
 
     bot.send_message.assert_not_awaited()
@@ -209,6 +209,119 @@ async def test_notify_admins_without_admins_configured(monkeypatch):
     bot = _bot()
     await main.notify_admins(bot, "проблема")
     bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feed_alerts_reach_admins(monkeypatch, digest):
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+    bot = _bot()
+    build = main.BuildResult(digest, None, feed_alerts=[("Пенза-Обзор", 3, "404")])
+
+    with patch.object(main, "_build_digest_blocking", return_value=build), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ):
+        result = await main.run_digest(bot, "-100")
+
+    assert result.ok
+    bot.send_message.assert_awaited_once()
+    text = bot.send_message.await_args.kwargs["text"]
+    assert "Пенза-Обзор" in text and "404" in text
+
+
+@pytest.mark.asyncio
+async def test_digest_is_pinned_when_enabled(monkeypatch, digest):
+    monkeypatch.setattr(main, "PIN_DIGEST", True)
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ) as send:
+        await main.run_digest(_bot(), "-100")
+    assert send.await_args.kwargs["pin"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Срочные новости
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_breaking_publishes_and_marks(digest):
+    import fetcher
+
+    bot = _bot()
+    with patch.object(main, "_breaking_blocking", return_value=(digest, None)), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ) as send:
+        result = await main.run_breaking(bot, "-100")
+
+    assert result.ok and "срочная" in result.message
+    send.assert_awaited_once()
+    assert send.await_args.kwargs.get("pin") is None, "срочные посты не закрепляем"
+
+    conn = fetcher.connect()
+    assert fetcher.is_published(conn, digest.articles[0])
+    last = fetcher.stats(conn)["last_run"]
+    assert last["status"] == "breaking"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_breaking_silent_when_nothing_urgent():
+    bot = _bot()
+    with patch.object(main, "_breaking_blocking", return_value=None), patch.object(
+        main.sender, "send_digest", new=AsyncMock()
+    ) as send:
+        result = await main.run_breaking(bot, "-100")
+
+    assert result.ok
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_breaking_skipped_outside_window(monkeypatch):
+    """Ночью бот молчит, даже если что-то произошло."""
+    monkeypatch.setattr(main, "BREAKING_FROM_HOUR", 9)
+    monkeypatch.setattr(main, "BREAKING_TO_HOUR", 21)
+
+    class FakeDatetime(main.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 30, 3, 0, tzinfo=tz)
+
+    monkeypatch.setattr(main, "datetime", FakeDatetime)
+    with patch.object(main, "run_breaking", new=AsyncMock()) as run:
+        await main.scheduled_breaking(_context(_bot()))
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_breaking_runs_inside_window(monkeypatch):
+    monkeypatch.setattr(main, "BREAKING_FROM_HOUR", 9)
+    monkeypatch.setattr(main, "BREAKING_TO_HOUR", 21)
+
+    class FakeDatetime(main.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 30, 14, 0, tzinfo=tz)
+
+    monkeypatch.setattr(main, "datetime", FakeDatetime)
+    with patch.object(
+        main, "run_breaking", new=AsyncMock(return_value=main.RunResult(True, "ок"))
+    ) as run:
+        await main.scheduled_breaking(_context(_bot()))
+    run.assert_awaited_once()
+
+
+def test_breaking_respects_daily_limit(monkeypatch, article_factory):
+    import fetcher
+
+    monkeypatch.setattr(main, "BREAKING_MAX_PER_DAY", 1)
+    conn = fetcher.connect()
+    fetcher.log_run(conn, "breaking", 1, "")
+    conn.close()
+
+    with patch.object(fetcher, "collect") as collect:
+        assert main._breaking_blocking() is None
+    collect.assert_not_called(), "лимит проверяется до обращения к лентам"
 
 
 # --------------------------------------------------------------------------- #

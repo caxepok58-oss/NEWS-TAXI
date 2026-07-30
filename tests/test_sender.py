@@ -112,6 +112,87 @@ async def test_bad_html_is_resent_as_plain_text():
 
 
 @pytest.mark.asyncio
+async def test_buttons_attach_to_last_message():
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    text = "<b>Заголовок</b>\n\n" + "\n\n".join(f"{i}. Новость " + "х" * 900 for i in range(6))
+    buttons = [("1. АвтоСтат", "https://a.ru/1"), ("2. Колёса", "https://b.ru/2")]
+
+    await sender.send_digest(bot, "-100", text, buttons=buttons)
+
+    calls = bot.send_message.await_args_list
+    assert len(calls) > 1
+    assert all(c.kwargs["reply_markup"] is None for c in calls[:-1])
+    markup = calls[-1].kwargs["reply_markup"]
+    assert markup is not None
+    urls = [b.url for row in markup.inline_keyboard for b in row]
+    assert urls == ["https://a.ru/1", "https://b.ru/2"]
+
+
+@pytest.mark.asyncio
+async def test_buttons_attach_to_photo_when_post_fits_caption():
+    bot = MagicMock()
+    bot.send_photo = AsyncMock()
+    bot.send_message = AsyncMock()
+    buttons = [("1. АвтоСтат", "https://a.ru/1")]
+
+    await sender.send_digest(bot, "-100", "<b>Короткий пост</b>", image=b"PNG", buttons=buttons)
+
+    bot.send_message.assert_not_awaited()
+    assert bot.send_photo.await_args.kwargs["reply_markup"] is not None
+
+
+def test_build_keyboard_lays_out_rows():
+    markup = sender.build_keyboard([(f"{i}. Источник", f"https://a.ru/{i}") for i in range(5)])
+    rows = markup.inline_keyboard
+    assert len(rows) == 3, "5 кнопок по 2 в ряд"
+    assert [len(r) for r in rows] == [2, 2, 1]
+
+
+def test_build_keyboard_without_buttons():
+    assert sender.build_keyboard([]) is None
+
+
+@pytest.mark.asyncio
+async def test_pin_requested_only_when_asked():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=555))
+    bot.pin_chat_message = AsyncMock()
+
+    await sender.send_digest(bot, "-100", "<b>пост</b>", pin=False)
+    bot.pin_chat_message.assert_not_awaited()
+
+    await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True)
+    bot.pin_chat_message.assert_awaited_once()
+    assert bot.pin_chat_message.await_args.kwargs["message_id"] == 555
+
+
+@pytest.mark.asyncio
+async def test_pin_pins_the_photo_message():
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(return_value=MagicMock(message_id=111))
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=222))
+    bot.pin_chat_message = AsyncMock()
+    text = "<b>Заголовок</b>\nВступление\n\n" + "\n\n".join(
+        f"{i}. Новость " + "х" * 300 for i in range(10)
+    )
+
+    await sender.send_digest(bot, "-100", text, image=b"PNG", pin=True)
+
+    assert bot.pin_chat_message.await_args.kwargs["message_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_missing_pin_rights_do_not_break_publication():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.pin_chat_message = AsyncMock(side_effect=TelegramError("not enough rights"))
+
+    sent = await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True)
+    assert sent == 1, "пост опубликован, несмотря на невозможность закрепить"
+
+
+@pytest.mark.asyncio
 async def test_send_notice_survives_failure():
     bot = MagicMock()
     bot.send_message = AsyncMock(side_effect=TelegramError("заблокирован"))

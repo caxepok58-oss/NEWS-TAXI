@@ -164,6 +164,10 @@ INCIDENT_KEYWORDS = (
     "наезд",
     "пожар",
     "возгоран",
+    "сгорел",
+    "сгорев",
+    "загорел",
+    "тушени",
     "погиб",
     "пострадал",
     "скончал",
@@ -178,6 +182,52 @@ INCIDENT_KEYWORDS = (
     "следственн",
     "спасател",
     "мчс",
+)
+
+# Признаки серьёзного ЧП: ради такого имеет смысл выйти вне расписания.
+# Обычное ДТП или бытовой пожар сюда намеренно не попадают.
+BREAKING_KEYWORDS = (
+    "погиб",
+    "взрыв",
+    "эвакуац",
+    "чрезвычайн",
+    "режим чс",
+    "обрушен",
+    "беспилотник",
+    "атака дрон",
+    "массов",
+    "крупный пожар",
+    "введен режим",
+    "перекрыт",
+    "отключен",
+    "пропал ребенок",
+    "разыскивают ребенка",
+)
+
+# Признаки того, что заметка про РЫНОК, а не про случившееся на дороге.
+# Нужны, чтобы отличить «отзыв партии машин после аварий» (рынок, берём)
+# от «в другом регионе машина столкнулась с локомотивом» (чужое ДТП, не берём).
+MARKET_KEYWORDS = (
+    "рынок",
+    "продаж",
+    "цен",
+    "подорожа",
+    "подешеве",
+    "модел",
+    "завод",
+    "конвейер",
+    "локализац",
+    "отзыв",
+    "закон",
+    "тариф",
+    "пошлин",
+    "утильсбор",
+    "спрос",
+    "выпуск",
+    "премьер",
+    "комплектац",
+    "лицензи",
+    "штраф",
 )
 
 PENZA_KEYWORDS = (
@@ -203,6 +253,10 @@ _TOPIC_KEYWORDS = {
 # --------------------------------------------------------------------------- #
 
 DB_PATH = os.getenv("DB_PATH", "digest.db")
+# За сколько дней сверять сюжеты уже опубликованных новостей.
+STORY_DEDUP_DAYS = int(os.getenv("STORY_DEDUP_DAYS", "3"))
+# После скольких неудачных прогонов подряд предупреждать о сломанной ленте.
+FEED_ALERT_AFTER = int(os.getenv("FEED_ALERT_AFTER", "3"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -397,6 +451,10 @@ def classify(text: str, feed: Feed) -> tuple[str | None, tuple[str, ...]]:
 
     # Происшествия берём только пензенские — так поставлена задача.
     if not is_penza:
+        # Чужое ДТП или пожар не должны перетекать в авторубрику: если заметка
+        # похожа на происшествие и в ней нет рыночных слов, отбрасываем её.
+        if hits[TOPIC_INCIDENT] and not _match_keywords(text, MARKET_KEYWORDS):
+            return None, ()
         hits[TOPIC_INCIDENT] = ()
 
     # Про такси и происшествия речь идёт чаще, чем про авто вообще,
@@ -405,8 +463,10 @@ def classify(text: str, feed: Feed) -> tuple[str | None, tuple[str, ...]]:
         if hits[topic]:
             return topic, hits[topic]
 
-    # Тема задана лентой явно (профильное издание) — доверяем ей.
-    if feed.topic and feed.topic != TOPIC_INCIDENT:
+    # Тема профильного издания — достаточное основание: там всё по делу.
+    # Поисковым лентам так доверять нельзя: они возвращают что угодно
+    # похожее на запрос, поэтому от них требуем совпадения по словам.
+    if feed.topic and feed.topic != TOPIC_INCIDENT and feed.tier == "primary":
         return feed.topic, ()
     return None, ()
 
@@ -477,7 +537,27 @@ def _entry_datetime(entry) -> datetime | None:
     return None
 
 
-def _fetch_feed(feed: Feed) -> list[Article]:
+@dataclass
+class FeedResult:
+    """Итог обращения к одной ленте — нужен и для отбора, и для контроля здоровья."""
+
+    feed: Feed
+    articles: list[Article] = field(default_factory=list)
+    entries_total: int = 0  # сколько записей вообще было в ленте
+    error: str = ""
+
+    @property
+    def broken(self) -> bool:
+        """Лента сломана: не ответила, не разобралась или пуста.
+
+        Ноль ПОДХОДЯЩИХ новостей — нормальная ситуация (сегодня издание просто
+        не писало по нашим темам), а ноль записей вообще — уже повод проверить
+        адрес ленты.
+        """
+        return bool(self.error) or self.entries_total == 0
+
+
+def _fetch_feed(feed: Feed) -> FeedResult:
     """Загружает и разбирает одну ленту. Ошибки не пробрасываются."""
     try:
         response = requests.get(
@@ -488,12 +568,13 @@ def _fetch_feed(feed: Feed) -> list[Article]:
         response.raise_for_status()
     except requests.RequestException as exc:
         log.warning("Лента %s недоступна: %s", feed.name, exc)
-        return []
+        return FeedResult(feed, error=str(exc)[:200])
 
     parsed = feedparser.parse(response.content)
     if parsed.bozo and not parsed.entries:
-        log.warning("Лента %s не разобрана: %s", feed.name, parsed.get("bozo_exception"))
-        return []
+        reason = str(parsed.get("bozo_exception") or "лента не разобрана")
+        log.warning("Лента %s не разобрана: %s", feed.name, reason)
+        return FeedResult(feed, error=reason[:200])
 
     articles: list[Article] = []
     for entry in parsed.entries:
@@ -536,17 +617,26 @@ def _fetch_feed(feed: Feed) -> list[Article]:
             )
         )
 
-    log.info("Лента %s: подходящих новостей — %d", feed.name, len(articles))
-    return articles
+    log.info(
+        "Лента %s: записей — %d, подходящих новостей — %d",
+        feed.name,
+        len(parsed.entries),
+        len(articles),
+    )
+    return FeedResult(feed, articles=articles, entries_total=len(parsed.entries))
 
 
-def fetch_feeds(feeds: Iterable[Feed], workers: int = 6) -> list[Article]:
+def fetch_feeds(feeds: Iterable[Feed], workers: int = 6) -> list[FeedResult]:
+    """Читает ленты параллельно. Возвращает результат по каждой."""
     feeds = list(feeds)
     if not feeds:
         return []
     with ThreadPoolExecutor(max_workers=min(workers, len(feeds))) as pool:
-        results = pool.map(_fetch_feed, feeds)
-    return [article for batch in results for article in batch]
+        return list(pool.map(_fetch_feed, feeds))
+
+
+def flatten(results: Iterable[FeedResult]) -> list[Article]:
+    return [article for result in results for article in result.articles]
 
 
 def is_aggregator_link(url: str) -> bool:
@@ -596,6 +686,15 @@ def init_db(conn: sqlite3.Connection) -> None:
             items      INTEGER NOT NULL DEFAULT 0,
             details    TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS feed_health (
+            name         TEXT PRIMARY KEY,
+            url          TEXT NOT NULL,
+            last_ok_at   TEXT,
+            broken_streak INTEGER NOT NULL DEFAULT 0,
+            alerted_at   TEXT,
+            last_error   TEXT
+        );
         """
     )
     conn.commit()
@@ -634,6 +733,97 @@ def mark_published(conn: sqlite3.Connection, articles: Iterable[Article]) -> int
     )
     conn.commit()
     return len(rows)
+
+
+def recent_titles(conn: sqlite3.Connection, days: int = STORY_DEDUP_DAYS) -> list[str]:
+    """Заголовки, опубликованные за последние `days` дней."""
+    if days <= 0:
+        return []
+    cutoff = (_now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        "SELECT title FROM published WHERE created_at >= ? ORDER BY created_at DESC",
+        (cutoff,),
+    ).fetchall()
+    return [row["title"] for row in rows]
+
+
+def is_known_story(article: Article, published_titles: Sequence[str]) -> bool:
+    """Писали ли мы уже об этом событии.
+
+    Точных хэшей мало: то же происшествие другое издание назовёт другими
+    словами и на следующий день оно пройдёт как новое.
+    """
+    return any(same_story(article.title, title) for title in published_titles)
+
+
+# --------------------------------------------------------------------------- #
+# Здоровье лент
+# --------------------------------------------------------------------------- #
+
+
+def record_feed_health(
+    conn: sqlite3.Connection, results: Iterable[FeedResult]
+) -> list[tuple[str, int, str]]:
+    """Обновляет статистику по лентам.
+
+    Возвращает список (имя, серия сбоев, ошибка) для лент, о которых пора
+    предупредить: серия достигла порога, а предупреждение ещё не отправлялось.
+    """
+    now = _now().isoformat()
+    to_alert: list[tuple[str, int, str]] = []
+
+    for result in results:
+        feed = result.feed
+        row = conn.execute(
+            "SELECT broken_streak, alerted_at FROM feed_health WHERE name = ?",
+            (feed.name,),
+        ).fetchone()
+        streak = row["broken_streak"] if row else 0
+
+        if result.broken:
+            streak += 1
+            reason = result.error or "лента пуста"
+            conn.execute(
+                """
+                INSERT INTO feed_health (name, url, broken_streak, last_error)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    url = excluded.url,
+                    broken_streak = excluded.broken_streak,
+                    last_error = excluded.last_error
+                """,
+                (feed.name, feed.url, streak, reason),
+            )
+            already_alerted = bool(row and row["alerted_at"])
+            if streak >= FEED_ALERT_AFTER and not already_alerted:
+                conn.execute(
+                    "UPDATE feed_health SET alerted_at = ? WHERE name = ?", (now, feed.name)
+                )
+                to_alert.append((feed.name, streak, reason))
+        else:
+            # Лента ожила — сбрасываем и серию, и отметку об уведомлении.
+            conn.execute(
+                """
+                INSERT INTO feed_health (name, url, last_ok_at, broken_streak, alerted_at)
+                VALUES (?, ?, ?, 0, NULL)
+                ON CONFLICT(name) DO UPDATE SET
+                    url = excluded.url,
+                    last_ok_at = excluded.last_ok_at,
+                    broken_streak = 0,
+                    alerted_at = NULL
+                """,
+                (feed.name, feed.url, now),
+            )
+
+    conn.commit()
+    return to_alert
+
+
+def feed_health(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM feed_health ORDER BY broken_streak DESC, name"
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def purge_old(conn: sqlite3.Connection, days: int = KEEP_HISTORY_DAYS) -> int:
@@ -713,28 +903,136 @@ def _pick(articles: Sequence[Article], max_items: int) -> list[Article]:
     return picked
 
 
+def limit_per_source(
+    selected: Sequence[Article],
+    pool: Sequence[Article] = (),
+    max_per_source: int = 2,
+) -> list[Article]:
+    """Не даёт одному изданию занять половину выпуска.
+
+    Лишние заметки сверх квоты выбрасываются, а освободившиеся места по
+    возможности добираются из остальных кандидатов — так выпуск не худеет.
+    """
+    if max_per_source <= 0:
+        return list(selected)
+
+    counts: dict[str, int] = {}
+    kept: list[Article] = []
+    dropped = 0
+    for article in selected:
+        if counts.get(article.source, 0) >= max_per_source:
+            dropped += 1
+            continue
+        counts[article.source] = counts.get(article.source, 0) + 1
+        kept.append(article)
+
+    if dropped:
+        chosen_urls = {a.url_hash for a in kept}
+        for article in pool:
+            if len(kept) >= len(selected):
+                break
+            if article.url_hash in chosen_urls:
+                continue
+            if counts.get(article.source, 0) >= max_per_source:
+                continue
+            counts[article.source] = counts.get(article.source, 0) + 1
+            chosen_urls.add(article.url_hash)
+            kept.append(article)
+        log.info(
+            "Ограничение по источникам: убрано %d заметок, добрано %d",
+            dropped,
+            len(kept) - (len(selected) - dropped),
+        )
+
+    kept.sort(key=lambda a: (TOPIC_ORDER.index(a.topic), -a.score))
+    return kept
+
+
+def find_breaking(
+    candidates: Sequence[Article],
+    *,
+    max_age_hours: int = 4,
+    min_sources: int = 2,
+) -> list[Article]:
+    """Отбирает новости, ради которых стоит нарушить утреннее расписание.
+
+    Срочной считается свежая пензенская новость, которая либо описывает
+    серьёзное ЧП (по ключевым словам), либо уже подхвачена несколькими
+    изданиями — это надёжный признак значимости.
+    """
+    urgent: list[Article] = []
+    for article in candidates:
+        if not article.is_penza or article.topic == TOPIC_AUTO:
+            continue
+        age = article.age_hours
+        if age is None or age > max_age_hours:
+            continue
+
+        text = f"{article.title} {article.summary}".lower().replace("ё", "е")
+        severe = bool(_match_keywords(text, BREAKING_KEYWORDS))
+        corroboration = sum(
+            1
+            for other in candidates
+            if other is not article
+            and other.source != article.source
+            and same_story(article.title, other.title)
+        )
+        if severe or corroboration + 1 >= min_sources:
+            urgent.append(article)
+
+    urgent.sort(key=lambda a: a.score, reverse=True)
+    return _dedupe(urgent)
+
+
+@dataclass
+class CollectResult:
+    """Кандидаты для выпуска и замечания к лентам, набранные по пути."""
+
+    candidates: list[Article] = field(default_factory=list)
+    feed_alerts: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __iter__(self):
+        return iter(self.candidates)
+
+
 def collect(
     conn: sqlite3.Connection,
     *,
     min_items: int = 5,
     limit: int = 20,
     max_age_hours: int = 36,
-) -> list[Article]:
+) -> CollectResult:
     """Возвращает до `limit` свежих неопубликованных новостей-кандидатов.
 
     Это не финальная подборка: список отсортирован и сбалансирован по темам,
     а выбор 5-8 лучших делает модель (см. summarizer.select_best).
     """
     cutoff = _now() - timedelta(hours=max_age_hours)
+    published_titles = recent_titles(conn)
 
     def prepare(raw: Sequence[Article]) -> list[Article]:
         fresh = [a for a in raw if a.published is None or a.published >= cutoff]
         for article in fresh:
             article.score = score(article)
         fresh.sort(key=lambda a: a.score, reverse=True)
-        return [a for a in _dedupe(fresh) if not is_published(conn, a)]
+        result = []
+        for article in _dedupe(fresh):
+            if is_published(conn, article):
+                continue
+            if is_known_story(article, published_titles):
+                log.debug("Об этом сюжете уже писали: %s", article.title[:80])
+                continue
+            result.append(article)
+        return result
 
-    candidates = prepare(fetch_feeds(FEEDS))
+    results = fetch_feeds(FEEDS)
+    alerts = record_feed_health(conn, results)
+    for name, streak, reason in alerts:
+        log.error("Лента %s не отвечает %d прогонов подряд: %s", name, streak, reason)
+    candidates = prepare(flatten(results))
     log.info("Основные ленты: кандидатов после дедупликации — %d", len(candidates))
 
     # Фолбэк через поиск нужен в двух случаях: новостей в принципе мало
@@ -749,14 +1047,14 @@ def collect(
             reason = "нет новостей по темам: " + ", ".join(missing)
         log.info("Подключаю поиск (%s)", reason)
 
-        extra = prepare(fetch_feeds(search_feeds))
+        extra = prepare(flatten(fetch_feeds(search_feeds)))
         candidates = _dedupe(sorted(candidates + extra, key=lambda a: a.score, reverse=True))
         log.info("После фолбэка кандидатов — %d", len(candidates))
 
     selected = _pick(candidates, limit)
     log.info(
-        "Отобрано новостей: %d (%s)",
+        "Кандидатов отобрано: %d (%s)",
         len(selected),
         ", ".join(f"{t}={sum(1 for a in selected if a.topic == t)}" for t in TOPIC_ORDER),
     )
-    return selected
+    return CollectResult(candidates=selected, feed_alerts=alerts)

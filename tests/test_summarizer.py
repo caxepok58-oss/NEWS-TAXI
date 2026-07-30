@@ -155,7 +155,7 @@ def test_select_best_tops_up_when_model_returns_too_few(article_factory):
 
 def test_render_uses_our_links_not_models(two_articles):
     payload = dict(DIGEST_PAYLOAD)
-    text = summarizer.render(payload, two_articles)
+    text, _ = summarizer.render(payload, two_articles, links_mode="inline")
     for article in two_articles:
         assert article.url in text
         assert article.source in text
@@ -168,7 +168,7 @@ def test_render_escapes_html(article_factory):
         "intro": "",
         "items": [{"id": 1, "headline": "A & B", "summary": "1 < 2"}],
     }
-    text = summarizer.render(payload, [article])
+    text, _ = summarizer.render(payload, [article], links_mode="inline")
     assert "&lt;b&gt;" in text and "&amp;" in text and "1 &lt; 2" in text
 
 
@@ -185,7 +185,7 @@ def test_render_groups_by_topic_and_numbers_sequentially(article_factory):
             {"id": i, "headline": f"H{i}", "summary": f"S{i}"} for i in (1, 2, 3)
         ],
     }
-    text = summarizer.render(payload, articles)
+    text, _ = summarizer.render(payload, articles, links_mode="inline")
     assert text.index("Рынок такси") < text.index("Авто и авторынок") < text.index(
         "Происшествия"
     )
@@ -202,7 +202,7 @@ def test_render_drops_items_without_matching_article(article_factory):
             {"id": 1, "headline": "Реальная", "summary": "y"},
         ],
     }
-    text = summarizer.render(payload, [article])
+    text, _ = summarizer.render(payload, [article], links_mode="inline")
     assert "Придуманная" not in text
     assert "Реальная" in text
 
@@ -211,6 +211,24 @@ def test_render_raises_when_nothing_matches(article_factory):
     payload = {"title": "T", "intro": "I", "items": [{"id": 42, "headline": "x", "summary": "y"}]}
     with pytest.raises(summarizer.SummarizerError):
         summarizer.render(payload, [article_factory()])
+
+
+def test_render_buttons_mode_moves_links_out_of_text(two_articles):
+    text, buttons = summarizer.render(dict(DIGEST_PAYLOAD), two_articles, links_mode="buttons")
+    assert "<a href" not in text, "в режиме кнопок ссылок в тексте быть не должно"
+    assert len(buttons) == 2
+    labels, urls = zip(*buttons)
+    assert urls == tuple(a.url for a in two_articles)
+    assert labels[0].startswith("1. ")
+    for article in two_articles:
+        assert article.source in text, "источник остаётся подписью в тексте"
+
+
+def test_render_button_labels_are_short_enough(article_factory):
+    article = article_factory(source="Очень длинное название издания " * 4)
+    payload = {"title": "T", "intro": "", "items": [{"id": 1, "headline": "H", "summary": "S"}]}
+    _, buttons = summarizer.render(payload, [article], links_mode="buttons")
+    assert len(buttons[0][0]) <= 60, "Telegram не примет слишком длинную подпись"
 
 
 def test_build_digest_reports_only_used_articles(two_articles, article_factory):
