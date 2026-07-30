@@ -3,3 +3,7 @@ feedparser>=6.0.11
 anthropic>=0.40.0
 requests>=2.32.0
 python-dotenv>=1.0.1
+# Извлечение текста статей со страниц изданий
+trafilatura>=1.12
+# Отрисовка обложки выпуска
+pillow>=10.0

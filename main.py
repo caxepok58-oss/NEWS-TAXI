@@ -13,7 +13,8 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, time as dtime, timezone
+from dataclasses import dataclass
+from datetime import datetime, time as dtime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -21,7 +22,9 @@ from dotenv import load_dotenv
 # Переменные окружения читаются на уровне модулей, поэтому .env грузим до импортов.
 load_dotenv()
 
+import extractor  # noqa: E402
 import fetcher  # noqa: E402
+import imagegen  # noqa: E402
 import sender  # noqa: E402
 import summarizer  # noqa: E402
 from telegram import Bot, Update  # noqa: E402
@@ -40,6 +43,11 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 MIN_ITEMS = int(os.getenv("MIN_ITEMS", "5"))
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "36"))
+# Сколько кандидатов уходит модели на финальный отбор.
+CANDIDATE_LIMIT = int(os.getenv("CANDIDATE_LIMIT", "20"))
+# Повтор после неудачного планового прогона.
+RETRY_MINUTES = int(os.getenv("RETRY_MINUTES", "30"))
+MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "2"))
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 ADMIN_USER_IDS = {
@@ -116,26 +124,46 @@ def digest_time() -> dtime:
 # --------------------------------------------------------------------------- #
 
 
-def _build_digest_blocking() -> tuple[str, list[fetcher.Article]] | None:
-    """Синхронная часть: сбор новостей + обращение к Anthropic.
+@dataclass
+class RunResult:
+    """Итог прогона: успех, сообщение для человека и нужен ли повтор."""
 
-    Возвращает (текст поста, вошедшие новости) либо None, если новостей нет.
-    Выполняется в отдельном потоке, чтобы не блокировать event loop.
+    ok: bool
+    message: str
+    retryable: bool = False
+
+
+def _build_digest_blocking() -> tuple[summarizer.Digest, bytes | None] | None:
+    """Синхронная часть прогона. None — если публиковать нечего.
+
+    Порядок: сбор кандидатов -> отбор моделью -> дочитывание статей ->
+    пересказ -> картинка. Выполняется в отдельном потоке, чтобы не
+    блокировать event loop бота.
     """
     conn = fetcher.connect()
     try:
         fetcher.purge_old(conn)
-        articles = fetcher.collect(
+        candidates = fetcher.collect(
             conn,
             min_items=MIN_ITEMS,
-            max_items=MAX_ITEMS,
+            limit=CANDIDATE_LIMIT,
             max_age_hours=MAX_AGE_HOURS,
         )
-        if not articles:
+        if not candidates:
             fetcher.log_run(conn, "empty", 0, "нет новых новостей")
             return None
-        text, used = summarizer.build_digest(articles)
-        return text, used
+
+        selected = summarizer.select_best(
+            candidates, min_items=MIN_ITEMS, max_items=MAX_ITEMS
+        )
+        if not selected:
+            fetcher.log_run(conn, "empty", 0, "модель не отобрала ни одной новости")
+            return None
+
+        extractor.enrich(selected)
+        digest = summarizer.build_digest(selected)
+        image = imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
+        return digest, image
     finally:
         conn.close()
 
@@ -150,13 +178,10 @@ def _mark_blocking(articles: list[fetcher.Article], status: str, details: str = 
         conn.close()
 
 
-async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> str:
-    """Полный цикл: собрать -> пересказать -> отправить -> запомнить.
-
-    Возвращает короткий человекочитаемый статус.
-    """
+async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> RunResult:
+    """Полный цикл: собрать -> пересказать -> отправить -> запомнить."""
     if _run_lock.locked():
-        return "Дайджест уже собирается, подождите."
+        return RunResult(False, "Дайджест уже собирается, подождите.")
 
     async with _run_lock:
         started = datetime.now(timezone.utc)
@@ -166,34 +191,58 @@ async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> 
         except summarizer.SummarizerError as exc:
             log.error("Ошибка сборки дайджеста: %s", exc)
             await asyncio.to_thread(_mark_blocking, [], "error", str(exc))
-            return f"Не удалось собрать дайджест: {exc}"
+            return RunResult(False, f"не удалось собрать дайджест: {exc}", retryable=True)
         except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
             log.exception("Непредвиденная ошибка при сборке дайджеста")
             await asyncio.to_thread(_mark_blocking, [], "error", repr(exc))
-            return f"Ошибка: {exc}"
+            return RunResult(False, f"ошибка сборки: {exc}", retryable=True)
 
         if result is None:
             log.info("Новых новостей нет — публиковать нечего")
-            return "Свежих новостей не нашлось — дайджест не отправлен."
+            # Это штатная ситуация, а не сбой: повторять и будить админов незачем.
+            return RunResult(True, "свежих новостей не нашлось, дайджест не отправлен")
 
-        text, used = result
+        digest, image = result
         if dry_run:
-            print(text)
-            log.info("Dry-run: пост собран (%d новостей), отправка пропущена", len(used))
-            return f"Dry-run: собрано {len(used)} новостей, ничего не отправлено."
+            print(digest.text)
+            if image:
+                path = os.getenv("DRY_RUN_IMAGE", "digest-preview.png")
+                with open(path, "wb") as handle:
+                    handle.write(image)
+                print(f"\n[картинка сохранена: {path}, {len(image) // 1024} КБ]")
+            log.info(
+                "Dry-run: пост собран (%d новостей), отправка пропущена",
+                len(digest.articles),
+            )
+            return RunResult(
+                True, f"dry-run: собрано {len(digest.articles)} новостей, ничего не отправлено"
+            )
 
         try:
-            await sender.send_digest(bot, chat_id, text)
+            await sender.send_digest(bot, chat_id, digest.text, image=image)
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось отправить дайджест")
             await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
-            return f"Дайджест собран, но не отправлен: {exc}"
+            return RunResult(
+                False, f"дайджест собран, но не отправлен: {exc}", retryable=True
+            )
 
         # Помечаем опубликованным только после успешной отправки.
-        await asyncio.to_thread(_mark_blocking, used, "ok")
+        await asyncio.to_thread(_mark_blocking, digest.articles, "ok")
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        log.info("=== Готово: %d новостей за %.1f с ===", len(used), elapsed)
-        return f"Дайджест отправлен: {len(used)} новостей."
+        log.info("=== Готово: %d новостей за %.1f с ===", len(digest.articles), elapsed)
+        return RunResult(True, f"дайджест отправлен: {len(digest.articles)} новостей")
+
+
+async def notify_admins(bot: Bot, text: str) -> None:
+    """Пишет о проблеме администраторам.
+
+    В общий чат такие сообщения не уходят: подписчикам они не нужны.
+    """
+    if not ADMIN_USER_IDS:
+        log.warning("ADMIN_USER_IDS не заданы — некому сообщить: %s", text)
+        return
+    await sender.send_notice(bot, ADMIN_USER_IDS, text)
 
 
 # --------------------------------------------------------------------------- #
@@ -279,13 +328,37 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Команда доступна только администраторам бота.")
         return
     await update.message.reply_text("Собираю дайджест, это займёт до минуты…")
-    status = await run_digest(context.bot, CHAT_ID)
-    await update.message.reply_text(status)
+    result = await run_digest(context.bot, CHAT_ID)
+    await update.message.reply_text(result.message.capitalize())
 
 
 async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    status = await run_digest(context.bot, CHAT_ID)
-    log.info("Плановый прогон: %s", status)
+    """Плановый прогон: при сбое сообщает админам и планирует повтор."""
+    result = await run_digest(context.bot, CHAT_ID)
+    log.info("Плановый прогон: %s", result.message)
+    if result.ok:
+        return
+
+    attempt = 0
+    if context.job is not None and isinstance(context.job.data, dict):
+        attempt = int(context.job.data.get("attempt", 0))
+
+    if result.retryable and attempt < MAX_RETRY_ATTEMPTS and RETRY_MINUTES > 0:
+        context.job_queue.run_once(
+            scheduled_digest,
+            when=timedelta(minutes=RETRY_MINUTES),
+            data={"attempt": attempt + 1},
+            name=f"digest-retry-{attempt + 1}",
+        )
+        tail = (
+            f"Повтор через {RETRY_MINUTES} мин "
+            f"(попытка {attempt + 1} из {MAX_RETRY_ATTEMPTS})."
+        )
+    else:
+        tail = "Повторов больше не будет — нужно вмешательство."
+
+    log.warning("Плановый прогон не удался. %s", tail)
+    await notify_admins(context.bot, f"⚠️ Дайджест не вышел: {result.message}. {tail}")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -319,16 +392,19 @@ def run_bot() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-async def run_once(dry_run: bool = False) -> None:
+async def run_once(dry_run: bool = False) -> int:
+    """Разовый прогон. Возвращает код выхода процесса."""
     check_config(require_telegram=not dry_run)
     if dry_run:
-        status = await run_digest(None, CHAT_ID, dry_run=True)  # type: ignore[arg-type]
-        log.info(status)
-        return
-    bot = Bot(token=BOT_TOKEN)
-    async with bot:
-        status = await run_digest(bot, CHAT_ID)
-    log.info(status)
+        result = await run_digest(None, CHAT_ID, dry_run=True)  # type: ignore[arg-type]
+    else:
+        bot = Bot(token=BOT_TOKEN)
+        async with bot:
+            result = await run_digest(bot, CHAT_ID)
+            if not result.ok:
+                await notify_admins(bot, f"⚠️ Дайджест не вышел: {result.message}")
+    log.info("Итог: %s", result.message)
+    return 0 if result.ok else 1
 
 
 def main() -> None:
@@ -343,11 +419,10 @@ def main() -> None:
 
     setup_logging()
     if args.dry_run:
-        asyncio.run(run_once(dry_run=True))
-    elif args.once:
-        asyncio.run(run_once())
-    else:
-        run_bot()
+        raise SystemExit(asyncio.run(run_once(dry_run=True)))
+    if args.once:
+        raise SystemExit(asyncio.run(run_once()))
+    run_bot()
 
 
 if __name__ == "__main__":

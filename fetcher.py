@@ -230,6 +230,13 @@ class Article:
     tier: str = "primary"
     score: float = 0.0
     keywords: tuple[str, ...] = field(default_factory=tuple)
+    image_url: str = ""  # картинка из вложения ленты, если есть
+    full_text: str = ""  # текст статьи, дочитывается в extractor.py
+
+    @property
+    def body(self) -> str:
+        """Самый содержательный доступный текст новости."""
+        return self.full_text or self.summary
 
     @property
     def url_hash(self) -> str:
@@ -355,8 +362,27 @@ def clean_text(raw: str, limit: int = 600) -> str:
     return text
 
 
+_WORD_RE = re.compile(r"[a-zа-я0-9]+")
+
+
 def _match_keywords(text: str, keywords: Sequence[str]) -> tuple[str, ...]:
-    return tuple(k for k in keywords if k in text)
+    """Ищет ключевые слова как НАЧАЛО слова, а не как произвольную подстроку.
+
+    Поиск по подстроке даёт грубые ложные срабатывания: «лада» находится внутри
+    «вкладам», «авто» — внутри «автономии». Сравнение по началу слова при этом
+    сохраняет русскую морфологию: «автомобил» по-прежнему ловит «автомобили»
+    и «автомобилях».
+    """
+    words = _WORD_RE.findall(text)
+    hits = []
+    for keyword in keywords:
+        if " " in keyword or "." in keyword:
+            # Составные ключи («яндекс go», «новая модель») ищем целиком.
+            if keyword in text:
+                hits.append(keyword)
+        elif any(word.startswith(keyword) for word in words):
+            hits.append(keyword)
+    return tuple(hits)
 
 
 # --------------------------------------------------------------------------- #
@@ -415,6 +441,29 @@ def score(article: Article) -> float:
 # --------------------------------------------------------------------------- #
 # Чтение лент
 # --------------------------------------------------------------------------- #
+
+
+_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _entry_image(entry) -> str:
+    """Ищет картинку новости среди вложений и медиа-тегов ленты."""
+    for enclosure in getattr(entry, "enclosures", []) or []:
+        href = enclosure.get("href") or enclosure.get("url") or ""
+        mime = (enclosure.get("type") or "").lower()
+        if href and (mime.startswith("image/") or href.lower().endswith(_IMAGE_EXT)):
+            return href
+
+    for key in ("media_content", "media_thumbnail"):
+        for media in getattr(entry, key, []) or []:
+            href = media.get("url") or ""
+            if href:
+                return href
+
+    # Последний шанс — первая картинка в HTML-описании.
+    html_body = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_body or "")
+    return match.group(1) if match else ""
 
 
 def _entry_datetime(entry) -> datetime | None:
@@ -483,6 +532,7 @@ def _fetch_feed(feed: Feed) -> list[Article]:
                 or feed.region == "penza",
                 tier=feed.tier,
                 keywords=keywords,
+                image_url=_entry_image(entry),
             )
         )
 
@@ -667,10 +717,14 @@ def collect(
     conn: sqlite3.Connection,
     *,
     min_items: int = 5,
-    max_items: int = 8,
+    limit: int = 20,
     max_age_hours: int = 36,
 ) -> list[Article]:
-    """Возвращает 0..max_items свежих неопубликованных новостей."""
+    """Возвращает до `limit` свежих неопубликованных новостей-кандидатов.
+
+    Это не финальная подборка: список отсортирован и сбалансирован по темам,
+    а выбор 5-8 лучших делает модель (см. summarizer.select_best).
+    """
     cutoff = _now() - timedelta(hours=max_age_hours)
 
     def prepare(raw: Sequence[Article]) -> list[Article]:
@@ -699,7 +753,7 @@ def collect(
         candidates = _dedupe(sorted(candidates + extra, key=lambda a: a.score, reverse=True))
         log.info("После фолбэка кандидатов — %d", len(candidates))
 
-    selected = _pick(candidates, max_items)
+    selected = _pick(candidates, limit)
     log.info(
         "Отобрано новостей: %d (%s)",
         len(selected),
