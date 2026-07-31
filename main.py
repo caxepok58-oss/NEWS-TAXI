@@ -90,6 +90,9 @@ BREAKING_MAX_PER_DAY = int(os.getenv("BREAKING_MAX_PER_DAY", "2"))
 # Окно, в котором разрешено выходить вне расписания (по TIMEZONE).
 BREAKING_FROM_HOUR = int(os.getenv("BREAKING_FROM_HOUR", "9"))
 BREAKING_TO_HOUR = int(os.getenv("BREAKING_TO_HOUR", "21"))
+# Резервные копии базы: куда складывать и сколько хранить.
+BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "14"))
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 ADMIN_USER_IDS = {
@@ -256,6 +259,27 @@ def _build_digest_blocking() -> BuildResult:
         conn.close()
 
 
+PINNED_KEY = "last_pinned_message_id"
+
+
+def _pinned_id() -> int | None:
+    """id закреплённого дайджеста, чтобы снять его перед новым."""
+    conn = fetcher.connect()
+    try:
+        value = fetcher.get_setting(conn, PINNED_KEY)
+        return int(value) if value and value.isdigit() else None
+    finally:
+        conn.close()
+
+
+def _remember_pinned(message_id: int | None) -> None:
+    conn = fetcher.connect()
+    try:
+        fetcher.set_setting(conn, PINNED_KEY, message_id)
+    finally:
+        conn.close()
+
+
 def _mark_blocking(articles: list[fetcher.Article], status: str, details: str = "") -> None:
     conn = fetcher.connect()
     try:
@@ -346,14 +370,18 @@ async def run_digest(
             )
 
         try:
-            await sender.send_digest(
+            previous_pin = await asyncio.to_thread(_pinned_id) if PIN_DIGEST else None
+            sent = await sender.send_digest(
                 bot,
                 chat_id,
                 digest.text,
                 image=image,
                 buttons=digest.buttons,
                 pin=PIN_DIGEST,
+                unpin=previous_pin,
             )
+            if getattr(sent, "pinned_id", None):
+                await asyncio.to_thread(_remember_pinned, sent.pinned_id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось отправить дайджест")
             await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
@@ -484,14 +512,18 @@ async def publish_pending(bot: Bot, key: str, reason: str = "") -> RunResult:
 
     digest = pending.digest
     try:
-        await sender.send_digest(
+        previous_pin = await asyncio.to_thread(_pinned_id) if PIN_DIGEST else None
+        sent = await sender.send_digest(
             bot,
             CHAT_ID,
             digest.text,
             image=pending.image,
             buttons=digest.buttons,
             pin=PIN_DIGEST,
+            unpin=previous_pin,
         )
+        if getattr(sent, "pinned_id", None):
+            await asyncio.to_thread(_remember_pinned, sent.pinned_id)
     except Exception as exc:  # noqa: BLE001
         log.exception("Не удалось отправить подтверждённый выпуск")
         await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
@@ -798,13 +830,15 @@ async def run_once(dry_run: bool = False) -> int:
 
 
 def check_feeds() -> int:
-    """Разовая проверка всех лент: адрес, число записей, ошибка."""
+    """Разовая проверка всех источников: адрес, число записей, ошибка."""
     all_feeds = list(fetcher.FEEDS) + list(fetcher.FALLBACK_FEEDS)
-    results = fetcher.fetch_feeds(all_feeds)
+    # Сайты без RSS проверяем вместе с лентами: они такой же источник,
+    # и вёрстка у них меняется чаще, чем адреса лент.
+    results = fetcher.fetch_feeds(all_feeds) + fetcher.fetch_sites()
 
     name_width = max(len(r.feed.name) for r in results)
     broken = 0
-    print(f"\n{'ЛЕНТА'.ljust(name_width)}  ЗАПИСЕЙ  ПОДХОДИТ  СОСТОЯНИЕ")
+    print(f"\n{'ИСТОЧНИК'.ljust(name_width)}  ЗАПИСЕЙ  ПОДХОДИТ  СОСТОЯНИЕ")
     print("-" * (name_width + 34))
     for result in sorted(results, key=lambda r: (not r.broken, r.feed.name)):
         state = "OK"
@@ -819,9 +853,9 @@ def check_feeds() -> int:
             f"{result.entries_total:>7}  {len(result.articles):>8}  {state}"
         )
 
-    print(f"\nВсего лент: {len(results)}, с проблемами: {broken}")
+    print(f"\nВсего источников: {len(results)}, с проблемами: {broken}")
     if not broken:
-        print("Все ленты отвечают.")
+        print("Все источники отвечают.")
 
     # Заодно обновляем статистику, чтобы бот не слал предупреждение
     # о ленте, которую вы только что починили.
@@ -831,6 +865,45 @@ def check_feeds() -> int:
     finally:
         conn.close()
     return 1 if broken else 0
+
+
+def backup_db(destination: str | None = None) -> int:
+    """Сохраняет копию базы. Путь по умолчанию — с датой в имени."""
+    if not destination:
+        stamp = datetime.now(digest_time().tzinfo).strftime("%Y%m%d-%H%M%S")
+        base = os.path.splitext(os.path.basename(fetcher.DB_PATH))[0]
+        destination = os.path.join(BACKUP_DIR, f"{base}-{stamp}.db")
+
+    os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+    try:
+        fetcher.backup(destination)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Резервная копия не создана: %s", exc)
+        print(f"Не удалось создать копию: {exc}")
+        return 1
+
+    size = os.path.getsize(destination)
+    log.info("Резервная копия базы: %s (%d КБ)", destination, size // 1024)
+    print(f"Копия базы: {destination} ({size // 1024} КБ)")
+    _prune_backups()
+    return 0
+
+
+def _prune_backups() -> None:
+    """Оставляет последние BACKUP_KEEP копий, старые удаляет."""
+    if BACKUP_KEEP <= 0 or not os.path.isdir(BACKUP_DIR):
+        return
+    copies = sorted(
+        (os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.endswith(".db")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for stale in copies[BACKUP_KEEP:]:
+        try:
+            os.remove(stale)
+            log.info("Удалена старая копия базы: %s", stale)
+        except OSError as exc:
+            log.warning("Не удалось удалить %s: %s", stale, exc)
 
 
 def main() -> None:
@@ -844,9 +917,18 @@ def main() -> None:
     parser.add_argument(
         "--check-feeds", action="store_true", help="проверить доступность всех лент и выйти"
     )
+    parser.add_argument(
+        "--backup",
+        nargs="?",
+        const="",
+        metavar="ПУТЬ",
+        help="сделать резервную копию базы и выйти",
+    )
     args = parser.parse_args()
 
     setup_logging()
+    if args.backup is not None:
+        raise SystemExit(backup_db(args.backup or None))
     if args.check_feeds:
         raise SystemExit(check_feeds())
     if args.dry_run:

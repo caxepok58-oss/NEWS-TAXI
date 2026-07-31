@@ -62,6 +62,17 @@ def conn():
     connection.close()
 
 
+@pytest.fixture(autouse=True)
+def no_site_scraping(monkeypatch):
+    """Тесты не ходят в сеть: разбор сайтов по умолчанию отключён.
+
+    Тот, кому он нужен, подменяет fetch_sites своими данными.
+    """
+    import fetcher
+
+    monkeypatch.setattr(fetcher, "fetch_sites", lambda: [])
+
+
 def anthropic_message(text: str, stop_reason: str = "end_turn"):
     """Ответ Anthropic API в том виде, в каком его читает summarizer."""
     return types.SimpleNamespace(

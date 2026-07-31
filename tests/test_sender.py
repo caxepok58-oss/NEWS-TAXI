@@ -70,7 +70,7 @@ async def test_send_digest_without_image():
     bot = MagicMock()
     bot.send_message = AsyncMock()
     sent = await sender.send_digest(bot, "-100", "<b>пост</b>")
-    assert sent == 1
+    assert sent.messages == 1
     assert bot.send_message.await_args.kwargs["parse_mode"] == "HTML"
 
 
@@ -87,7 +87,7 @@ async def test_send_digest_with_image_uses_photo_and_caption():
     bot.send_photo.assert_awaited_once()
     assert bot.send_photo.await_args.kwargs["photo"] == b"PNGDATA"
     assert "Заголовок" in bot.send_photo.await_args.kwargs["caption"]
-    assert sent == 1 + bot.send_message.await_count
+    assert sent.messages == 1 + bot.send_message.await_count
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,46 @@ async def test_missing_pin_rights_do_not_break_publication():
     bot.pin_chat_message = AsyncMock(side_effect=TelegramError("not enough rights"))
 
     sent = await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True)
-    assert sent == 1, "пост опубликован, несмотря на невозможность закрепить"
+    assert sent.messages == 1, "пост опубликован, несмотря на невозможность закрепить"
+    assert sent.pinned_id is None, "закрепить не вышло — и запоминать нечего"
+
+
+@pytest.mark.asyncio
+async def test_previous_pin_is_removed():
+    """Иначе за месяц в шапке чата копится тридцать дайджестов."""
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+    bot.pin_chat_message = AsyncMock()
+    bot.unpin_chat_message = AsyncMock()
+
+    sent = await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True, unpin=555)
+
+    bot.unpin_chat_message.assert_awaited_once()
+    assert bot.unpin_chat_message.await_args.kwargs["message_id"] == 555
+    assert bot.pin_chat_message.await_args.kwargs["message_id"] == 777
+    assert sent.pinned_id == 777
+
+
+@pytest.mark.asyncio
+async def test_failed_unpin_does_not_block_new_pin():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+    bot.pin_chat_message = AsyncMock()
+    bot.unpin_chat_message = AsyncMock(side_effect=TelegramError("message not found"))
+
+    sent = await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True, unpin=555)
+    assert sent.pinned_id == 777
+
+
+@pytest.mark.asyncio
+async def test_nothing_to_unpin_on_first_run():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.pin_chat_message = AsyncMock()
+    bot.unpin_chat_message = AsyncMock()
+
+    await sender.send_digest(bot, "-100", "<b>пост</b>", pin=True, unpin=None)
+    bot.unpin_chat_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

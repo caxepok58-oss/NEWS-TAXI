@@ -69,9 +69,8 @@ FEEDS: tuple[Feed, ...] = (
     Feed("Пенза-Обзор", "https://penzaobzor.ru/rss", region="penza"),
     Feed("Пронедра/Progorod58", "https://progorod58.ru/rss", region="penza"),
     Feed("Пензенская правда", "https://pravda-news.ru/rss", region="penza"),
-    Feed("ПензаСМИ", google_news("site:penzasmi.ru"), region="penza"),
-    Feed("РИА Пензенской области", google_news("site:riapo.ru"), region="penza"),
-    Feed("PenzaInform", google_news("site:penzainform.ru"), region="penza"),
+    # penzasmi.ru, riapo.ru и penzainform.ru своей ленты не имеют — они
+    # читаются разбором страницы со списком новостей, см. scraper.SITES.
     Feed("АвтоСтат", "https://www.autostat.ru/news/rss/", topic=TOPIC_AUTO),
     Feed("Kolesa.ru", "https://www.kolesa.ru/feed", topic=TOPIC_AUTO),
     Feed("5 колесо", "https://5koleso.ru/feed/", topic=TOPIC_AUTO),
@@ -639,6 +638,62 @@ def flatten(results: Iterable[FeedResult]) -> list[Article]:
     return [article for result in results for article in result.articles]
 
 
+# Рубрика в адресе — подсказка там, где заголовок сам по себе о теме молчит.
+_INCIDENT_URL_MARKERS = ("/incidents/", "/proisshestvi", "/proishestvi", "/bezopasnost")
+
+
+def articles_from_site(result) -> FeedResult:
+    """Переводит разобранную страницу сайта в тот же вид, что и лента.
+
+    Так у страниц без RSS и у обычных лент общий путь: одна классификация,
+    один рейтинг, один контроль здоровья источника.
+    """
+    site = result.site
+    feed = Feed(site.name, site.url, region="penza")
+    if result.error:
+        return FeedResult(feed, error=result.error)
+
+    articles: list[Article] = []
+    for item in result.items:
+        haystack = item.title.lower().replace("ё", "е")
+        topic, keywords = classify(haystack, feed)
+        if topic is None and any(m in item.url for m in _INCIDENT_URL_MARKERS):
+            # Сайт пензенский, а раздел прямо назван «происшествия» —
+            # заголовку вроде «Стало известно состояние пострадавшего»
+            # ключевых слов может не хватить.
+            topic = TOPIC_INCIDENT
+        if topic is None:
+            continue
+
+        articles.append(
+            Article(
+                title=item.title,
+                url=item.url,
+                summary="",  # текст дочитает extractor: ссылка прямая
+                source=site.name,
+                topic=topic,
+                published=item.published,
+                is_penza=True,
+                keywords=keywords,
+            )
+        )
+
+    log.info(
+        "Сайт %s: записей — %d, подходящих новостей — %d",
+        site.name,
+        result.links_total,
+        len(articles),
+    )
+    return FeedResult(feed, articles=articles, entries_total=result.links_total)
+
+
+def fetch_sites() -> list[FeedResult]:
+    """Читает издания без RSS разбором страницы со списком новостей."""
+    import scraper  # локальный импорт: модуль нужен только здесь
+
+    return [articles_from_site(result) for result in scraper.fetch_sites()]
+
+
 def is_aggregator_link(url: str) -> bool:
     """Ссылка ведёт на агрегатор, а не напрямую в издание.
 
@@ -687,6 +742,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             details    TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS feed_health (
             name         TEXT PRIMARY KEY,
             url          TEXT NOT NULL,
@@ -733,6 +793,24 @@ def mark_published(conn: sqlite3.Connection, articles: Iterable[Article]) -> int
     )
     conn.commit()
     return len(rows)
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
+    """Небольшое состояние бота между запусками (id закреплённого поста и т. п.)."""
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str | int | None) -> None:
+    if value is None:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+    conn.commit()
 
 
 def recent_titles(conn: sqlite3.Connection, days: int = STORY_DEDUP_DAYS) -> list[str]:
@@ -824,6 +902,25 @@ def feed_health(conn: sqlite3.Connection) -> list[dict]:
         "SELECT * FROM feed_health ORDER BY broken_streak DESC, name"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def backup(destination: str, db_path: str | None = None) -> str:
+    """Делает копию базы штатным механизмом SQLite.
+
+    Простое копирование файла на работающем боте может застать базу в момент
+    записи; backup() отдаёт согласованный снимок. База — это вся память о
+    том, что уже публиковалось: без неё бот выдаст в эфир старые новости.
+    """
+    source = sqlite3.connect(db_path or DB_PATH)
+    try:
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+    return destination
 
 
 def purge_old(conn: sqlite3.Connection, days: int = KEEP_HISTORY_DAYS) -> int:
@@ -1052,7 +1149,7 @@ def collect(
             result.append(article)
         return result
 
-    results = fetch_feeds(FEEDS)
+    results = fetch_feeds(FEEDS) + fetch_sites()
     alerts = record_feed_health(conn, results)
     for name, streak, reason in alerts:
         log.error("Лента %s не отвечает %d прогонов подряд: %s", name, streak, reason)

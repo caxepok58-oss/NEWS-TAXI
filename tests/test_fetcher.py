@@ -202,6 +202,33 @@ def test_dedup_matches_by_title_when_url_differs(conn, article_factory):
     assert fetcher.is_published(conn, reprint)
 
 
+def test_settings_roundtrip(conn):
+    assert fetcher.get_setting(conn, "last_pinned_message_id") is None
+    fetcher.set_setting(conn, "last_pinned_message_id", 555)
+    assert fetcher.get_setting(conn, "last_pinned_message_id") == "555"
+    fetcher.set_setting(conn, "last_pinned_message_id", 777)
+    assert fetcher.get_setting(conn, "last_pinned_message_id") == "777"
+    fetcher.set_setting(conn, "last_pinned_message_id", None)
+    assert fetcher.get_setting(conn, "last_pinned_message_id") is None
+
+
+def test_backup_creates_usable_copy(tmp_path, article_factory):
+    """База — это вся память о публикациях: копия должна быть рабочей."""
+    source = tmp_path / "digest.db"
+    conn = fetcher.connect(str(source))
+    article = article_factory()
+    fetcher.mark_published(conn, [article])
+    conn.close()
+
+    target = tmp_path / "copy.db"
+    fetcher.backup(str(target), db_path=str(source))
+
+    assert target.exists()
+    restored = fetcher.connect(str(target))
+    assert fetcher.is_published(restored, article)
+    restored.close()
+
+
 def test_purge_old_removes_stale_rows(conn, article_factory):
     fetcher.mark_published(conn, [article_factory()])
     assert fetcher.stats(conn)["published_total"] == 1

@@ -127,6 +127,22 @@ def test_cover_with_all_topics_fits(article_factory):
     assert draw.textlength(line, font=imagegen._font(26, bold=False)) <= text_width
 
 
+def test_cover_date_uses_channel_timezone(monkeypatch):
+    """Сервер живёт по UTC: без пересчёта ночной пост получил бы вчерашнее число."""
+    from datetime import datetime, timezone as tz
+
+    monkeypatch.setattr(imagegen, "TIMEZONE", "Europe/Moscow")
+    now = imagegen._now_local()
+    utc_now = datetime.now(tz.utc)
+    assert now.utcoffset() is not None, "время должно быть с зоной"
+    assert now.hour == (utc_now.hour + 3) % 24
+
+
+def test_cover_falls_back_on_unknown_timezone(monkeypatch):
+    monkeypatch.setattr(imagegen, "TIMEZONE", "Нет/Такого")
+    assert imagegen._now_local() is not None
+
+
 def test_build_image_off_returns_none(article_factory):
     assert imagegen.build_image("Тест", [article_factory()], mode="off") is None
 

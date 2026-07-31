@@ -599,6 +599,55 @@ async def test_preview_falls_open_without_job_queue(monkeypatch, digest):
 
 
 # --------------------------------------------------------------------------- #
+# Закрепление и бэкап
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_pinned_id_is_remembered_and_reused(digest):
+    """Чтобы завтра было что откреплять."""
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender,
+        "send_digest",
+        new=AsyncMock(return_value=main.sender.SendResult(messages=1, pinned_id=321)),
+    ) as send:
+        await main.run_digest(_bot(), "-100")
+
+    assert send.await_args.kwargs["unpin"] is None, "в первый раз откреплять нечего"
+    assert main._pinned_id() == 321
+
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender,
+        "send_digest",
+        new=AsyncMock(return_value=main.sender.SendResult(messages=1, pinned_id=654)),
+    ) as send:
+        await main.run_digest(_bot(), "-100")
+
+    assert send.await_args.kwargs["unpin"] == 321, "снимаем вчерашнее закрепление"
+    assert main._pinned_id() == 654
+
+
+def test_backup_writes_file(tmp_path, capsys):
+    target = tmp_path / "copy.db"
+    assert main.backup_db(str(target)) == 0
+    assert target.exists()
+    assert "Копия базы" in capsys.readouterr().out
+
+
+def test_backup_reports_failure(tmp_path, capsys):
+    assert main.backup_db(str(tmp_path / "нет" / "такой" / "папки" / "\0")) == 1
+
+
+def test_old_backups_are_pruned(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "BACKUP_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "BACKUP_KEEP", 3)
+    for i in range(6):
+        main.backup_db(str(tmp_path / f"copy{i}.db"))
+
+    assert len(list(tmp_path.glob("*.db"))) == 3
+
+
+# --------------------------------------------------------------------------- #
 # Доступ к командам
 # --------------------------------------------------------------------------- #
 

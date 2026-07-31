@@ -1,5 +1,6 @@
 .env
 *.db
+backups/
 *.log
 *.log.*
 __pycache__/

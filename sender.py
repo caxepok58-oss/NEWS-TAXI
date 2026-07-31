@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,6 +16,18 @@ log = logging.getLogger(__name__)
 
 # Сколько кнопок ставить в один ряд.
 BUTTONS_PER_ROW = 2
+
+
+@dataclass
+class SendResult:
+    """Итог публикации: сколько сообщений ушло и что закрепили."""
+
+    messages: int = 0
+    pinned_id: int | None = None
+
+    def __int__(self) -> int:
+        return self.messages
+
 
 # Лимит Telegram — 4096 символов на сообщение и 1024 на подпись к фото;
 # берём с запасом.
@@ -153,8 +166,20 @@ async def _send_photo(
     return None
 
 
-async def pin_message(bot: Bot, chat_id: str | int, message_id: int) -> bool:
-    """Закрепляет сообщение. Без прав администратора просто пишет в лог."""
+async def pin_message(
+    bot: Bot, chat_id: str | int, message_id: int, unpin: int | None = None
+) -> bool:
+    """Закрепляет сообщение, сняв предыдущее закрепление.
+
+    Telegram держит закреплённые сообщения списком: без открепления за месяц
+    в шапке чата накопится тридцать дайджестов.
+    """
+    if unpin:
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=unpin)
+        except TelegramError as exc:
+            log.debug("Не удалось открепить прошлый пост %s: %s", unpin, exc)
+
     try:
         await bot.pin_chat_message(
             chat_id=chat_id, message_id=message_id, disable_notification=True
@@ -172,11 +197,12 @@ async def send_digest(
     image: bytes | None = None,
     buttons: Sequence[tuple[str, str]] = (),
     pin: bool = False,
-) -> int:
+    unpin: int | None = None,
+) -> SendResult:
     """Отправляет пост (при необходимости — несколькими сообщениями).
 
     Клавиатура со ссылками ставится на последнее сообщение, закрепляется —
-    первое (с картинкой, если она есть). Возвращает число сообщений.
+    первое (с картинкой, если она есть).
     """
     keyboard = build_keyboard(buttons)
     chunks: Sequence[str]
@@ -212,11 +238,13 @@ async def send_digest(
         if not last:
             await asyncio.sleep(1)  # не упираемся в лимит частоты
 
+    pinned_id = None
     if pin and first_message is not None:
-        await pin_message(bot, chat_id, first_message.message_id)
+        if await pin_message(bot, chat_id, first_message.message_id, unpin=unpin):
+            pinned_id = first_message.message_id
 
     log.info("Дайджест отправлен в %s (%d сообщ.)", chat_id, sent)
-    return sent
+    return SendResult(messages=sent, pinned_id=pinned_id)
 
 
 async def send_notice(bot: Bot, chat_ids: Iterable[str | int], text: str) -> None:

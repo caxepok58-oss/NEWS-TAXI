@@ -34,6 +34,7 @@ from fetcher import TOPIC_TITLES, Article
 log = logging.getLogger(__name__)
 
 MODE = os.getenv("IMAGE_MODE", "cover").strip().lower()
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -105,6 +106,20 @@ def _wrap(draw, text: str, font, max_width: int) -> list[str]:
     return lines
 
 
+def _now_local() -> datetime:
+    """Текущее время в часовом поясе канала.
+
+    Сервер обычно живёт по UTC: без пересчёта ночной пост получил бы на
+    обложке вчерашнее число.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:  # noqa: BLE001 - нет зоны, обойдёмся часами сервера
+        return datetime.now()
+
+
 def render_cover(
     title: str,
     articles: Sequence[Article] = (),
@@ -117,7 +132,7 @@ def render_cover(
         log.warning("Pillow не установлен — пост уйдёт без картинки")
         return None
 
-    when = when or datetime.now()
+    when = when or _now_local()
     top, bottom, accent = random.choice(_PALETTES)
 
     image = Image.new("RGB", (WIDTH, HEIGHT), top)
