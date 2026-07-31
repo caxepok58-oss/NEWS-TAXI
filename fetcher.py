@@ -841,6 +841,30 @@ def log_run(conn: sqlite3.Connection, status: str, items: int, details: str = ""
     conn.commit()
 
 
+def had_digest_today(conn: sqlite3.Connection, tzinfo=None) -> bool:
+    """Отрабатывал ли сегодня основной выпуск.
+
+    Нужно после перезапуска: планировщик просроченное задание пропускает,
+    и без этой проверки дайджест за день молча не выйдет вовсе.
+    Срочные посты (`breaking`) за выпуск не считаются.
+    """
+    today = datetime.now(tzinfo or timezone.utc).date()
+    rows = conn.execute(
+        "SELECT started_at FROM runs WHERE status IN ('ok', 'empty') "
+        "ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    for row in rows:
+        try:
+            started = datetime.fromisoformat(row["started_at"])
+        except (TypeError, ValueError):
+            continue
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        if started.astimezone(tzinfo or timezone.utc).date() == today:
+            return True
+    return False
+
+
 def stats(conn: sqlite3.Connection) -> dict:
     total = conn.execute("SELECT COUNT(*) AS c FROM published").fetchone()["c"]
     last = conn.execute(

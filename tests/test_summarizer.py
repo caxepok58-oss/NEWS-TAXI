@@ -243,3 +243,120 @@ def test_build_digest_reports_only_used_articles(two_articles, article_factory):
 def test_build_digest_requires_articles():
     with pytest.raises(summarizer.SummarizerError):
         summarizer.build_digest([], client=MagicMock())
+
+
+# --------------------------------------------------------------------------- #
+# Даты в промпте
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_carries_dates(article_factory):
+    """Без дат модель не может корректно написать «сегодня» — и выдумывает."""
+    from datetime import datetime, timezone
+
+    article = article_factory(published=datetime(2026, 7, 30, 6, 15, tzinfo=timezone.utc))
+    prompt = summarizer._digest_prompt([article])
+    assert "Сегодня" in prompt
+    assert "Опубликовано: 30.07.2026" in prompt
+
+
+def test_prompt_handles_missing_date(article_factory):
+    article = article_factory(published=None)
+    assert "время неизвестно" in summarizer._digest_prompt([article])
+
+
+# --------------------------------------------------------------------------- #
+# Пересказ своими словами
+# --------------------------------------------------------------------------- #
+
+SOURCE_TEXT = (
+    "В региональной Госавтоинспекции сообщили подробности аварии, которая "
+    "произошла двадцать девятого июля в Каменке на улице Чернышевского."
+)
+
+
+def test_borrowed_fragment_detects_copy():
+    copied = "В региональной Госавтоинспекции сообщили подробности аварии, которая произошла"
+    assert summarizer.borrowed_fragment(copied, SOURCE_TEXT, n=7)
+
+
+def test_borrowed_fragment_allows_paraphrase():
+    own = "Автоинспекция раскрыла обстоятельства ДТП в Каменке."
+    assert summarizer.borrowed_fragment(own, SOURCE_TEXT, n=7) == ""
+
+
+def test_borrowed_fragment_ignores_short_summaries():
+    assert summarizer.borrowed_fragment("Авария в Каменке", SOURCE_TEXT, n=7) == ""
+
+
+def test_enforce_own_words_asks_for_rewrite(article_factory):
+    article = article_factory(full_text=SOURCE_TEXT)
+    data = {
+        "title": "T",
+        "intro": "I",
+        "items": [
+            {
+                "id": 1,
+                "headline": "H",
+                "summary": "В региональной Госавтоинспекции сообщили подробности аварии, которая произошла",
+            }
+        ],
+    }
+    client = client_returning({"items": [{"id": 1, "summary": "Автоинспекция раскрыла детали ДТП."}]})
+
+    result = summarizer.enforce_own_words(data, [article], client=client)
+
+    assert result["items"][0]["summary"] == "Автоинспекция раскрыла детали ДТП."
+    client.messages.create.assert_called_once()
+
+
+def test_enforce_own_words_drops_summary_if_still_copied(article_factory):
+    """Лучше один заголовок, чем абзац, скопированный у издания."""
+    copied = "В региональной Госавтоинспекции сообщили подробности аварии, которая произошла"
+    article = article_factory(full_text=SOURCE_TEXT)
+    data = {"title": "T", "intro": "I", "items": [{"id": 1, "headline": "H", "summary": copied}]}
+    client = client_returning({"items": [{"id": 1, "summary": copied}]})
+
+    result = summarizer.enforce_own_words(data, [article], client=client)
+    assert result["items"][0]["summary"] == ""
+
+
+def test_enforce_own_words_skips_clean_digest(article_factory):
+    article = article_factory(full_text=SOURCE_TEXT)
+    data = {
+        "title": "T",
+        "intro": "I",
+        "items": [{"id": 1, "headline": "H", "summary": "Автоинспекция раскрыла детали ДТП."}],
+    }
+    client = MagicMock()
+    assert summarizer.enforce_own_words(data, [article], client=client) is data
+    client.messages.create.assert_not_called()
+
+
+def test_enforce_own_words_survives_api_error(article_factory):
+    copied = "В региональной Госавтоинспекции сообщили подробности аварии, которая произошла"
+    article = article_factory(full_text=SOURCE_TEXT)
+    data = {"title": "T", "intro": "I", "items": [{"id": 1, "headline": "H", "summary": copied}]}
+    client = MagicMock()
+    client.messages.create.side_effect = anthropic.APIConnectionError(request=MagicMock())
+
+    result = summarizer.enforce_own_words(data, [article], client=client)
+    assert result["items"][0]["summary"] == "", "при сбое описание убираем"
+
+
+def test_build_digest_runs_copy_check(two_articles):
+    """Проверка на копирование встроена в основной путь."""
+    copied = " ".join(f"слово{i}" for i in range(12))
+    two_articles[0].full_text = copied
+    payload = {
+        "title": "T",
+        "intro": "I",
+        "items": [
+            {"id": 1, "headline": "H1", "summary": copied},
+            {"id": 2, "headline": "H2", "summary": "Свой текст."},
+        ],
+    }
+    client = client_returning(payload, {"items": [{"id": 1, "summary": "Переписано иначе."}]})
+    digest = summarizer.build_digest(two_articles, client=client)
+    assert copied not in digest.text
+    assert "Переписано иначе." in digest.text

@@ -12,10 +12,13 @@ import argparse
 import asyncio
 import logging
 import os
+import re
+import secrets as secrets_mod
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Sequence
 
 from dotenv import load_dotenv
 
@@ -27,8 +30,18 @@ import fetcher  # noqa: E402
 import imagegen  # noqa: E402
 import sender  # noqa: E402
 import summarizer  # noqa: E402
-from telegram import Bot, Update  # noqa: E402
-from telegram.ext import Application, CommandHandler, ContextTypes  # noqa: E402
+from telegram import (  # noqa: E402
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (  # noqa: E402
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 log = logging.getLogger("digest")
 
@@ -50,8 +63,24 @@ MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "2"))
 # Повтор после неудачного планового прогона.
 RETRY_MINUTES = int(os.getenv("RETRY_MINUTES", "30"))
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "2"))
+# На сколько минут опоздания планировщик всё ещё выполнит задание.
+MISFIRE_GRACE_MINUTES = int(os.getenv("MISFIRE_GRACE_MINUTES", "60"))
+# Догонять выпуск, пропущенный из-за простоя бота.
+CATCH_UP_MISSED = os.getenv("CATCH_UP_MISSED", "1") not in ("0", "false", "False", "")
 # Закреплять утренний дайджест в чате (нужны права администратора).
 PIN_DIGEST = os.getenv("PIN_DIGEST", "1") not in ("0", "false", "False", "")
+
+# --- Предпросмотр ---------------------------------------------------------
+# Показывать выпуск администратору и ждать подтверждения перед публикацией.
+PREVIEW_BEFORE_PUBLISH = os.getenv("PREVIEW_BEFORE_PUBLISH", "0") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+PREVIEW_TIMEOUT_MINUTES = int(os.getenv("PREVIEW_TIMEOUT_MINUTES", "60"))
+# Что делать, если админ не ответил: publish (по умолчанию) или cancel.
+PREVIEW_ON_TIMEOUT = os.getenv("PREVIEW_ON_TIMEOUT", "publish").strip().lower()
 
 # --- Срочные новости ------------------------------------------------------
 BREAKING_ENABLED = os.getenv("BREAKING_ENABLED", "1") not in ("0", "false", "False", "")
@@ -71,9 +100,43 @@ ADMIN_USER_IDS = {
 _run_lock = asyncio.Lock()
 
 
+# Шаблоны секретов на случай, если в лог попадёт строка, которой нет в конфиге
+# (например, URL Telegram с токеном внутри сообщения об ошибке сети).
+_SECRET_PATTERNS = (
+    re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"),
+    re.compile(r"sk-ant-[A-Za-z0-9_-]{10,}"),
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),  # голый токен бота
+)
+
+
+class RedactingFormatter(logging.Formatter):
+    """Форматтер, вычищающий секреты из сообщений и трейсбеков.
+
+    Сетевые ошибки Telegram несут внутри URL с токеном бота, а файл лога
+    обычно лежит без всякой защиты. Затираем на выходе, а не в записи, —
+    так под фильтр попадает и текст исключения.
+    """
+
+    def __init__(self, fmt: str, datefmt: str, secrets: Sequence[str] = ()):
+        super().__init__(fmt, datefmt)
+        # Слишком короткие значения не трогаем: затрут пол-лога.
+        self._secrets = sorted({s for s in secrets if s and len(s) >= 8}, key=len, reverse=True)
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        for pattern in _SECRET_PATTERNS:
+            text = pattern.sub("***", text)
+        return text
+
+
 def setup_logging() -> None:
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"
+    formatter = RedactingFormatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+        secrets=(BOT_TOKEN, os.getenv("ANTHROPIC_API_KEY", ""),
+                 os.getenv("FUSIONBRAIN_API_KEY", ""), os.getenv("FUSIONBRAIN_SECRET_KEY", "")),
     )
     file_handler = RotatingFileHandler(
         LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
@@ -203,7 +266,26 @@ def _mark_blocking(articles: list[fetcher.Article], status: str, details: str = 
         conn.close()
 
 
-async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> RunResult:
+def _preview_available(job_queue) -> bool:
+    """Можно ли отправить выпуск на подтверждение.
+
+    Если предпросмотр включён, но некому показывать или негде отсчитать
+    таймаут, публикуем сразу: пропущенный выпуск хуже неотсмотренного.
+    """
+    if not PREVIEW_BEFORE_PUBLISH:
+        return False
+    if not ADMIN_USER_IDS:
+        log.warning("Предпросмотр включён, но ADMIN_USER_IDS пусты — публикую сразу")
+        return False
+    if job_queue is None:
+        log.warning("Предпросмотр недоступен без планировщика — публикую сразу")
+        return False
+    return True
+
+
+async def run_digest(
+    bot: Bot, chat_id: str | int, *, dry_run: bool = False, job_queue=None
+) -> RunResult:
     """Полный цикл: собрать -> пересказать -> отправить -> запомнить."""
     if _run_lock.locked():
         return RunResult(False, "Дайджест уже собирается, подождите.")
@@ -248,6 +330,19 @@ async def run_digest(bot: Bot, chat_id: str | int, *, dry_run: bool = False) -> 
             )
             return RunResult(
                 True, f"dry-run: собрано {len(digest.articles)} новостей, ничего не отправлено"
+            )
+
+        if _preview_available(job_queue):
+            key = await send_preview(bot, digest, image)
+            job_queue.run_once(
+                preview_timed_out,
+                when=timedelta(minutes=PREVIEW_TIMEOUT_MINUTES),
+                data={"key": key},
+                name=f"preview-timeout-{key}",
+            )
+            log.info("Выпуск отправлен на подтверждение администратору")
+            return RunResult(
+                True, f"выпуск на подтверждении у администратора ({len(digest.articles)} новостей)"
             )
 
         try:
@@ -334,6 +429,127 @@ async def run_breaking(bot: Bot, chat_id: str | int) -> RunResult:
         await asyncio.to_thread(_mark_blocking, digest.articles, "breaking")
         log.info("Опубликована срочная новость")
         return RunResult(True, "опубликована срочная новость")
+
+
+@dataclass
+class PendingDigest:
+    """Выпуск, ожидающий решения администратора."""
+
+    digest: summarizer.Digest
+    image: bytes | None
+    created_at: datetime
+
+
+# Ключ -> выпуск. Хранится в памяти: после перезапуска ожидающий
+# подтверждения выпуск теряется и будет собран заново в следующий прогон.
+_pending: dict[str, PendingDigest] = {}
+
+
+async def send_preview(bot: Bot, digest: summarizer.Digest, image: bytes | None) -> str:
+    """Отправляет выпуск админам и возвращает ключ ожидания."""
+    key = secrets_mod.token_urlsafe(8)
+    _pending[key] = PendingDigest(digest, image, datetime.now(timezone.utc))
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub:{key}"),
+                InlineKeyboardButton("✖️ Отменить", callback_data=f"skip:{key}"),
+            ]
+        ]
+    )
+    head = (
+        f"Предпросмотр выпуска ({len(digest.articles)} новостей). "
+        "Так он уйдёт в канал:"
+    )
+    for admin_id in sorted(ADMIN_USER_IDS):
+        await sender.send_notice(bot, [admin_id], head)
+        await sender.send_digest(
+            bot, admin_id, digest.text, image=image, buttons=digest.buttons
+        )
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f"Публикуем? Без ответа через {PREVIEW_TIMEOUT_MINUTES} мин — "
+            + ("выпуск уйдёт сам." if PREVIEW_ON_TIMEOUT == "publish" else "выпуск отменится."),
+            reply_markup=keyboard,
+        )
+    return key
+
+
+async def publish_pending(bot: Bot, key: str, reason: str = "") -> RunResult:
+    """Публикует выпуск, ожидавший подтверждения."""
+    pending = _pending.pop(key, None)
+    if pending is None:
+        return RunResult(True, "выпуск уже обработан")
+
+    digest = pending.digest
+    try:
+        await sender.send_digest(
+            bot,
+            CHAT_ID,
+            digest.text,
+            image=pending.image,
+            buttons=digest.buttons,
+            pin=PIN_DIGEST,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Не удалось отправить подтверждённый выпуск")
+        await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
+        return RunResult(False, f"выпуск не отправлен: {exc}", retryable=True)
+
+    await asyncio.to_thread(_mark_blocking, digest.articles, "ok")
+    log.info("Выпуск опубликован%s: %d новостей", reason, len(digest.articles))
+    return RunResult(True, f"дайджест отправлен: {len(digest.articles)} новостей")
+
+
+async def on_preview_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатие «Опубликовать» / «Отменить»."""
+    query = update.callback_query
+    action, _, key = (query.data or "").partition(":")
+
+    if ADMIN_USER_IDS and query.from_user.id not in ADMIN_USER_IDS:
+        await query.answer("Только для администраторов", show_alert=True)
+        return
+
+    if key not in _pending:
+        await query.answer("Этот выпуск уже обработан")
+        await query.edit_message_text("Выпуск уже обработан.")
+        return
+
+    if action == "pub":
+        await query.answer("Публикую…")
+        result = await publish_pending(context.bot, key, reason=" по кнопке")
+        await query.edit_message_text(
+            "✅ Опубликовано." if result.ok else f"Не удалось: {result.message}"
+        )
+    else:
+        pending = _pending.pop(key, None)
+        await query.answer("Отменено")
+        await query.edit_message_text("✖️ Выпуск отменён, новости остались в очереди.")
+        if pending is not None:
+            # Новости НЕ помечаем опубликованными — вернутся в следующий выпуск.
+            await asyncio.to_thread(_mark_blocking, [], "cancelled", "отменён админом")
+
+
+async def preview_timed_out(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ не ответил — поступаем по настройке PREVIEW_ON_TIMEOUT."""
+    key = (context.job.data or {}).get("key", "")
+    if key not in _pending:
+        return
+
+    if PREVIEW_ON_TIMEOUT == "cancel":
+        _pending.pop(key, None)
+        log.warning("Подтверждение не получено — выпуск отменён")
+        await notify_admins(context.bot, "✖️ Подтверждение не получено, выпуск отменён.")
+        return
+
+    log.warning("Подтверждение не получено — публикую без него")
+    result = await publish_pending(context.bot, key, reason=" по таймауту")
+    await notify_admins(
+        context.bot,
+        "Подтверждение не получено, "
+        + ("выпуск опубликован автоматически." if result.ok else f"сбой: {result.message}"),
+    )
 
 
 async def notify_admins(bot: Bot, text: str) -> None:
@@ -430,13 +646,13 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Команда доступна только администраторам бота.")
         return
     await update.message.reply_text("Собираю дайджест, это займёт до минуты…")
-    result = await run_digest(context.bot, CHAT_ID)
+    result = await run_digest(context.bot, CHAT_ID, job_queue=context.job_queue)
     await update.message.reply_text(result.message.capitalize())
 
 
 async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Плановый прогон: при сбое сообщает админам и планирует повтор."""
-    result = await run_digest(context.bot, CHAT_ID)
+    result = await run_digest(context.bot, CHAT_ID, job_queue=context.job_queue)
     log.info("Плановый прогон: %s", result.message)
     if result.ok:
         return
@@ -463,6 +679,44 @@ async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     await notify_admins(context.bot, f"⚠️ Дайджест не вышел: {result.message}. {tail}")
 
 
+def _missed_todays_digest() -> bool:
+    """Пора ли наверстать сегодняшний выпуск (проверяется при старте)."""
+    tzinfo = digest_time().tzinfo
+    now = datetime.now(tzinfo)
+    scheduled = now.replace(
+        hour=digest_time().hour, minute=digest_time().minute, second=0, microsecond=0
+    )
+    if now < scheduled:
+        return False  # время публикации ещё не пришло
+
+    conn = fetcher.connect()
+    try:
+        return not fetcher.had_digest_today(conn, tzinfo)
+    finally:
+        conn.close()
+
+
+async def catch_up(application: Application) -> None:
+    """Догоняет выпуск, пропущенный из-за простоя бота.
+
+    Планировщик просроченные задания не выполняет: если сервер перезагрузился
+    в момент публикации, дайджест за день молча не вышел бы вовсе.
+    """
+    if not CATCH_UP_MISSED:
+        return
+    try:
+        missed = await asyncio.to_thread(_missed_todays_digest)
+    except Exception:  # noqa: BLE001 - проверка не должна мешать запуску
+        log.exception("Не удалось проверить пропущенный выпуск")
+        return
+
+    if missed:
+        log.warning("Сегодняшний выпуск пропущен — запускаю с опозданием")
+        application.job_queue.run_once(
+            scheduled_digest, when=timedelta(seconds=30), name="digest-catch-up"
+        )
+
+
 async def scheduled_breaking(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Проверка срочных новостей между выпусками — только в дневном окне."""
     hour = datetime.now(digest_time().tzinfo).hour
@@ -484,13 +738,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def run_bot() -> None:
     check_config()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(catch_up).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("chatid", cmd_chatid))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("digest", cmd_digest))
+    application.add_handler(CallbackQueryHandler(on_preview_button, pattern=r"^(pub|skip):"))
     application.add_error_handler(on_error)
 
     if application.job_queue is None:
@@ -498,7 +753,14 @@ def run_bot() -> None:
             "JobQueue недоступна. Установите зависимости: "
             'pip install "python-telegram-bot[job-queue]"'
         )
-    application.job_queue.run_daily(scheduled_digest, time=digest_time(), name="daily-digest")
+    application.job_queue.run_daily(
+        scheduled_digest,
+        time=digest_time(),
+        name="daily-digest",
+        # Планировщик по умолчанию пропускает задание, просроченное больше чем
+        # на секунду: перезагрузка сервера в момент публикации стоила бы выпуска.
+        job_kwargs={"misfire_grace_time": MISFIRE_GRACE_MINUTES * 60},
+    )
     log.info("Бот запущен. Дайджест ежедневно в %s (%s)", DIGEST_TIME, TIMEZONE)
 
     if BREAKING_ENABLED and BREAKING_EVERY_HOURS > 0:

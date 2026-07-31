@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html import escape
 from typing import Sequence
 
@@ -31,6 +32,9 @@ MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "4000"))
 # buttons — ссылки уходят в inline-кнопки под постом, текст остаётся чистым;
 # inline  — ссылка строкой под каждой новостью.
 LINKS_MODE = os.getenv("LINKS_MODE", "buttons").strip().lower()
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+# Длина совпадающей цепочки слов, после которой пересказ считается копией.
+COPY_NGRAM = int(os.getenv("COPY_NGRAM", "7"))
 
 # --------------------------------------------------------------------------- #
 # Промпты и схемы
@@ -93,6 +97,18 @@ DIGEST_SYSTEM_PROMPT = """\
 8. В поле image_prompt опиши обложку выпуска для генератора изображений:
    краткая фраза на русском, предметная сцена без текста, надписей и логотипов,
    например «городская улица с автомобилями на рассвете, вид сверху».
+9. Не пиши «сегодня», «вчера», «на прошлой неделе» и подобное, если это не
+   следует из указанной даты публикации новости. Когда сомневаешься — обходись
+   без указания времени.
+"""
+
+REPHRASE_SYSTEM_PROMPT = """\
+Ты — редактор новостного дайджеста. Присланные описания слишком близки к тексту
+источника: в них есть дословно совпадающие фрагменты.
+
+Перепиши каждое описание заново своими словами: измени порядок изложения,
+подбери другие формулировки, но сохрани смысл и не добавляй фактов, которых
+нет в исходном тексте. Объём — 1-2 предложения. Верни те же id.
 """
 
 DIGEST_SCHEMA = {
@@ -277,15 +293,31 @@ def select_best(
 # --------------------------------------------------------------------------- #
 
 
+def _local_time(moment) -> str:
+    """Время публикации в часовом поясе канала."""
+    if moment is None:
+        return "время неизвестно"
+    try:
+        from zoneinfo import ZoneInfo
+
+        moment = moment.astimezone(ZoneInfo(TIMEZONE))
+    except Exception:  # noqa: BLE001 - без зоны просто покажем как есть
+        pass
+    return moment.strftime("%d.%m.%Y %H:%M")
+
+
 def _digest_prompt(articles: Sequence[Article]) -> str:
+    now = _local_time(datetime.now(timezone.utc))
     lines = [
+        f"Сегодня {now} (часовой пояс {TIMEZONE}).",
         f"Сегодняшняя подборка: {len(articles)} новостей. "
-        "Составь из них один дайджест.\n"
+        "Составь из них один дайджест.\n",
     ]
     for index, article in enumerate(articles, start=1):
         lines.append(f"[id: {index}]")
         lines.append(f"Тема: {TOPIC_TITLES[article.topic]}")
         lines.append(f"Источник: {article.source}")
+        lines.append(f"Опубликовано: {_local_time(article.published)}")
         lines.append(f"Заголовок: {article.title}")
         lines.append(f"Текст: {article.body or '(текст недоступен)'}")
         lines.append("")
@@ -306,6 +338,141 @@ def request_digest(
     )
     if not isinstance(data.get("items"), list) or not data["items"]:
         raise SummarizerError("Модель не вернула ни одной новости")
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# Шаг 3: проверка, что пересказ не скопирован
+# --------------------------------------------------------------------------- #
+
+REPHRASE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["id", "summary"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["items"],
+    "additionalProperties": False,
+}
+
+_WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
+
+
+def _words(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower().replace("ё", "е"))
+
+
+def borrowed_fragment(summary: str, source: str, n: int = COPY_NGRAM) -> str:
+    """Возвращает дословно совпадающий фрагмент из источника, если он есть.
+
+    Требование «пересказывать своими словами» до сих пор жило только в
+    промпте. Здесь оно проверяется фактически: ищем цепочку из n слов подряд,
+    которая встречается и в пересказе, и в тексте источника.
+    """
+    if n <= 0:
+        return ""
+    summary_words, source_words = _words(summary), _words(source)
+    if len(summary_words) < n or len(source_words) < n:
+        return ""
+
+    source_ngrams = {
+        tuple(source_words[i : i + n]) for i in range(len(source_words) - n + 1)
+    }
+    for i in range(len(summary_words) - n + 1):
+        chunk = tuple(summary_words[i : i + n])
+        if chunk in source_ngrams:
+            return " ".join(chunk)
+    return ""
+
+
+def find_borrowed(
+    data: dict, articles: Sequence[Article], n: int = COPY_NGRAM
+) -> dict[int, str]:
+    """id пересказов, слишком близких к тексту источника."""
+    by_id = {index: article for index, article in enumerate(articles, start=1)}
+    borrowed: dict[int, str] = {}
+    for item in data.get("items", []):
+        try:
+            item_id = int(item["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        article = by_id.get(item_id)
+        if article is None:
+            continue
+        fragment = borrowed_fragment(item.get("summary", ""), article.body, n)
+        if fragment:
+            borrowed[item_id] = fragment
+    return borrowed
+
+
+def enforce_own_words(
+    data: dict,
+    articles: Sequence[Article],
+    client: anthropic.Anthropic | None = None,
+) -> dict:
+    """Просит переписать скопированные описания, упрямые — убирает.
+
+    Лучше выпустить новость с одним заголовком, чем с абзацем, скопированным
+    у издания.
+    """
+    borrowed = find_borrowed(data, articles)
+    if not borrowed:
+        return data
+
+    log.warning(
+        "Слишком близко к источнику (%d из %d): %s",
+        len(borrowed),
+        len(data.get("items", [])),
+        "; ".join(f"#{i}: «{frag}»" for i, frag in borrowed.items()),
+    )
+
+    by_id = {index: article for index, article in enumerate(articles, start=1)}
+    items_by_id = {}
+    for item in data["items"]:
+        try:
+            items_by_id[int(item["id"])] = item
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    prompt_lines = []
+    for item_id in borrowed:
+        article = by_id[item_id]
+        prompt_lines.append(f"[id: {item_id}]")
+        prompt_lines.append(f"Заголовок: {article.title}")
+        prompt_lines.append(f"Исходный текст: {article.body}")
+        prompt_lines.append(f"Твоё описание: {items_by_id[item_id].get('summary', '')}")
+        prompt_lines.append("")
+
+    try:
+        rewritten = _ask(
+            client or anthropic.Anthropic(),
+            REPHRASE_SYSTEM_PROMPT,
+            "\n".join(prompt_lines),
+            REPHRASE_SCHEMA,
+            max_tokens=1500,
+        )
+        for item in rewritten.get("items", []):
+            item_id = int(item["id"])
+            if item_id in items_by_id and item.get("summary"):
+                items_by_id[item_id]["summary"] = item["summary"]
+    except (SummarizerError, anthropic.APIError, ValueError, TypeError, KeyError) as exc:
+        log.warning("Переписать описания не удалось (%s)", exc)
+
+    # Что не исправилось — оставляем без описания, с одним заголовком.
+    still_borrowed = find_borrowed(data, articles)
+    for item_id, fragment in still_borrowed.items():
+        log.warning("Убираю описание #%d: всё ещё копия («%s»)", item_id, fragment)
+        items_by_id[item_id]["summary"] = ""
     return data
 
 
@@ -398,6 +565,7 @@ def build_digest(
         raise SummarizerError("Нет новостей для дайджеста")
 
     data = request_digest(articles, client=client)
+    data = enforce_own_words(data, articles, client=client)
     text, buttons = render(data, articles)
 
     used_ids = {

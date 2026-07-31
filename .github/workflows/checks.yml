@@ -1,0 +1,91 @@
+name: Тесты и проверка лент
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Каждый понедельник в 06:00 UTC — проверяем, что ленты живы.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  feeds:
+    name: Доступность лент
+    # Ленты живут своей жизнью, поэтому проверяем их по расписанию,
+    # а не на каждый коммит: иначе чужая поломка красит наши сборки.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Проверить ленты
+        id: check
+        run: |
+          set +e
+          python main.py --check-feeds > feeds.txt 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat feeds.txt
+        env:
+          DB_PATH: ci-check.db
+          LOG_FILE: ci-check.log
+
+      - name: Завести issue о сломанной ленте
+        if: steps.check.outputs.status != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('feeds.txt', 'utf8');
+            const title = 'Недоступны RSS-ленты';
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'feeds',
+            });
+
+            const body = [
+              'Еженедельная проверка нашла ленты, которые не отвечают.',
+              'Адреса изданий иногда меняются — проверьте и поправьте `FEEDS` в `fetcher.py`.',
+              '',
+              '```',
+              report.trim(),
+              '```',
+            ].join('\n');
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                labels: ['feeds'],
+                body,
+              });
+            }

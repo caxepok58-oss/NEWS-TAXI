@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -322,6 +324,278 @@ def test_breaking_respects_daily_limit(monkeypatch, article_factory):
     with patch.object(fetcher, "collect") as collect:
         assert main._breaking_blocking() is None
     collect.assert_not_called(), "лимит проверяется до обращения к лентам"
+
+
+# --------------------------------------------------------------------------- #
+# Секреты в логах
+# --------------------------------------------------------------------------- #
+
+
+def _format(record_msg: str, secrets=(), exc_info=None) -> str:
+    formatter = main.RedactingFormatter("%(message)s", "%H:%M:%S", secrets=secrets)
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, record_msg, (), exc_info)
+    return formatter.format(record)
+
+
+def test_known_secrets_are_redacted():
+    out = _format("ключ sk-ant-secret12345 в тексте", secrets=("sk-ant-secret12345",))
+    assert "sk-ant-secret12345" not in out and "***" in out
+
+
+def test_bot_token_in_url_is_redacted_without_being_configured():
+    """Токен приходит внутри URL в ошибках сети, даже если строка не в конфиге."""
+    out = _format("POST https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage")
+    assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in out
+    assert "***" in out
+
+
+def test_short_values_are_not_redacted():
+    """Короткое значение затёрло бы пол-лога."""
+    out = _format("сообщение про ok", secrets=("ok",))
+    assert "сообщение про ok" == out
+
+
+def test_traceback_is_redacted():
+    try:
+        raise RuntimeError("упало на sk-ant-secret12345")
+    except RuntimeError:
+        out = _format("ошибка", secrets=("sk-ant-secret12345",), exc_info=sys.exc_info())
+    assert "sk-ant-secret12345" not in out
+    assert "RuntimeError" in out
+
+
+# --------------------------------------------------------------------------- #
+# Наверстывание пропущенного выпуска
+# --------------------------------------------------------------------------- #
+
+
+def test_missed_digest_detected_after_scheduled_time(monkeypatch):
+    monkeypatch.setattr(main, "DIGEST_TIME", "00:01")
+    assert main._missed_todays_digest() is True
+
+
+def test_not_missed_before_scheduled_time(monkeypatch):
+    monkeypatch.setattr(main, "DIGEST_TIME", "23:59")
+    assert main._missed_todays_digest() is False
+
+
+def test_not_missed_when_digest_already_ran(monkeypatch):
+    import fetcher
+
+    monkeypatch.setattr(main, "DIGEST_TIME", "00:01")
+    conn = fetcher.connect()
+    fetcher.log_run(conn, "ok", 5, "")
+    conn.close()
+    assert main._missed_todays_digest() is False
+
+
+def test_breaking_post_does_not_count_as_digest(monkeypatch):
+    """Срочная новость выпуск не заменяет."""
+    import fetcher
+
+    monkeypatch.setattr(main, "DIGEST_TIME", "00:01")
+    conn = fetcher.connect()
+    fetcher.log_run(conn, "breaking", 1, "")
+    conn.close()
+    assert main._missed_todays_digest() is True
+
+
+@pytest.mark.asyncio
+async def test_catch_up_schedules_run(monkeypatch):
+    monkeypatch.setattr(main, "CATCH_UP_MISSED", True)
+    monkeypatch.setattr(main, "_missed_todays_digest", lambda: True)
+    app = MagicMock()
+    await main.catch_up(app)
+    app.job_queue.run_once.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_catch_up_disabled(monkeypatch):
+    monkeypatch.setattr(main, "CATCH_UP_MISSED", False)
+    app = MagicMock()
+    await main.catch_up(app)
+    app.job_queue.run_once.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Предпросмотр с подтверждением
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def clear_pending():
+    main._pending.clear()
+    yield
+    main._pending.clear()
+
+
+def _preview_on(monkeypatch):
+    monkeypatch.setattr(main, "PREVIEW_BEFORE_PUBLISH", True)
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+
+
+@pytest.mark.asyncio
+async def test_preview_holds_publication(monkeypatch, digest):
+    import fetcher
+
+    _preview_on(monkeypatch)
+    bot = _bot()
+    queue = MagicMock()
+
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender, "send_digest", new=AsyncMock()
+    ) as send:
+        result = await main.run_digest(bot, "-100", job_queue=queue)
+
+    assert result.ok and "подтверждени" in result.message
+    assert len(main._pending) == 1
+    queue.run_once.assert_called_once()
+    # Отправка была только админу, не в канал.
+    assert all(call.args[1] == 42 for call in send.await_args_list)
+
+    conn = fetcher.connect()
+    assert not fetcher.is_published(conn, digest.articles[0]), "до подтверждения не публикуем"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_preview_publishes_on_approval(monkeypatch, digest):
+    import fetcher
+
+    _preview_on(monkeypatch)
+    bot = _bot()
+    key = await main.send_preview(bot, digest, None)
+
+    with patch.object(main.sender, "send_digest", new=AsyncMock(return_value=1)) as send:
+        result = await main.publish_pending(bot, key)
+
+    assert result.ok
+    assert send.await_args.args[1] == main.CHAT_ID
+    assert key not in main._pending
+    conn = fetcher.connect()
+    assert fetcher.is_published(conn, digest.articles[0])
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_news_for_next_issue(monkeypatch, digest):
+    import fetcher
+
+    _preview_on(monkeypatch)
+    bot = _bot()
+    key = await main.send_preview(bot, digest, None)
+
+    query = MagicMock()
+    query.data = f"skip:{key}"
+    query.from_user.id = 42
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    update = MagicMock(callback_query=query)
+    context = MagicMock(bot=bot)
+
+    await main.on_preview_button(update, context)
+
+    assert key not in main._pending
+    conn = fetcher.connect()
+    assert not fetcher.is_published(conn, digest.articles[0]), (
+        "отменённые новости должны вернуться в следующий выпуск"
+    )
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_preview_button_rejects_strangers(monkeypatch, digest):
+    _preview_on(monkeypatch)
+    key = await main.send_preview(_bot(), digest, None)
+
+    query = MagicMock()
+    query.data = f"pub:{key}"
+    query.from_user.id = 999
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    await main.on_preview_button(MagicMock(callback_query=query), MagicMock(bot=_bot()))
+
+    assert key in main._pending, "чужак не должен публиковать выпуск"
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_second_click_is_harmless(monkeypatch, digest):
+    _preview_on(monkeypatch)
+    bot = _bot()
+    key = await main.send_preview(bot, digest, None)
+    main._pending.pop(key)
+
+    query = MagicMock()
+    query.data = f"pub:{key}"
+    query.from_user.id = 42
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    with patch.object(main.sender, "send_digest", new=AsyncMock()) as send:
+        await main.on_preview_button(MagicMock(callback_query=query), MagicMock(bot=bot))
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_timeout_publishes_by_default(monkeypatch, digest):
+    _preview_on(monkeypatch)
+    monkeypatch.setattr(main, "PREVIEW_ON_TIMEOUT", "publish")
+    bot = _bot()
+    key = await main.send_preview(bot, digest, None)
+
+    context = MagicMock(bot=bot)
+    context.job.data = {"key": key}
+    with patch.object(main.sender, "send_digest", new=AsyncMock(return_value=1)) as send:
+        await main.preview_timed_out(context)
+
+    assert send.await_args.args[1] == main.CHAT_ID
+    assert key not in main._pending
+
+
+@pytest.mark.asyncio
+async def test_timeout_can_cancel_instead(monkeypatch, digest):
+    _preview_on(monkeypatch)
+    monkeypatch.setattr(main, "PREVIEW_ON_TIMEOUT", "cancel")
+    bot = _bot()
+    key = await main.send_preview(bot, digest, None)
+
+    context = MagicMock(bot=bot)
+    context.job.data = {"key": key}
+    with patch.object(main.sender, "send_digest", new=AsyncMock()) as send:
+        await main.preview_timed_out(context)
+
+    send.assert_not_awaited()
+    assert key not in main._pending
+
+
+@pytest.mark.asyncio
+async def test_preview_falls_open_without_admins(monkeypatch, digest):
+    """Некому подтверждать — публикуем сразу: пропуск выпуска хуже."""
+    monkeypatch.setattr(main, "PREVIEW_BEFORE_PUBLISH", True)
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", set())
+
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ) as send:
+        result = await main.run_digest(_bot(), "-100", job_queue=MagicMock())
+
+    assert result.ok and "отправлен" in result.message
+    send.assert_awaited_once()
+    assert not main._pending
+
+
+@pytest.mark.asyncio
+async def test_preview_falls_open_without_job_queue(monkeypatch, digest):
+    _preview_on(monkeypatch)
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ) as send:
+        result = await main.run_digest(_bot(), "-100", job_queue=None)
+
+    assert result.ok
+    send.assert_awaited_once()
 
 
 # --------------------------------------------------------------------------- #
