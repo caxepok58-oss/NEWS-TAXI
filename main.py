@@ -23,7 +23,10 @@ from typing import Sequence
 from dotenv import load_dotenv
 
 # Переменные окружения читаются на уровне модулей, поэтому .env грузим до импортов.
-load_dotenv()
+# override=True: .env — единственный источник настроек бота, и он должен побеждать
+# случайные одноимённые переменные из окружения (их легко не заметить: настройка
+# в .env молча не применится, а бот пойдёт не туда с невнятной ошибкой).
+load_dotenv(override=True)
 
 import extractor  # noqa: E402
 import fetcher  # noqa: E402

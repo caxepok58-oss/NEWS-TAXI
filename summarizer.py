@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "4000"))
+# Пустое значение — официальный api.anthropic.com. Непустое — совместимый
+# шлюз-посредник; у таких обычно свои имена моделей, см. ANTHROPIC_MODEL.
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "").strip()
 # buttons — ссылки уходят в inline-кнопки под постом, текст остаётся чистым;
 # inline  — ссылка строкой под каждой новостью.
 LINKS_MODE = os.getenv("LINKS_MODE", "buttons").strip().lower()
@@ -172,6 +175,13 @@ def _extract_json(text: str) -> dict:
             raise SummarizerError(f"Не удалось разобрать JSON: {exc}") from exc
 
 
+def make_client() -> anthropic.Anthropic:
+    """Клиент Anthropic: официальный или через шлюз из ANTHROPIC_BASE_URL."""
+    if BASE_URL:
+        return anthropic.Anthropic(base_url=BASE_URL)
+    return anthropic.Anthropic()
+
+
 def _ask(
     client: anthropic.Anthropic,
     system: str,
@@ -254,7 +264,7 @@ def select_best(
     if len(candidates) <= min_items:
         return candidates[:max_items]
 
-    client = client or anthropic.Anthropic()
+    client = client or make_client()
     try:
         data = _ask(
             client,
@@ -328,7 +338,7 @@ def request_digest(
     articles: Sequence[Article], client: anthropic.Anthropic | None = None
 ) -> dict:
     """Возвращает разобранный ответ модели: {title, intro, image_prompt, items[]}."""
-    client = client or anthropic.Anthropic()
+    client = client or make_client()
     data = _ask(
         client,
         DIGEST_SYSTEM_PROMPT,
@@ -455,7 +465,7 @@ def enforce_own_words(
 
     try:
         rewritten = _ask(
-            client or anthropic.Anthropic(),
+            client or make_client(),
             REPHRASE_SYSTEM_PROMPT,
             "\n".join(prompt_lines),
             REPHRASE_SCHEMA,

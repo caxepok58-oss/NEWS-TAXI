@@ -360,3 +360,40 @@ def test_build_digest_runs_copy_check(two_articles):
     digest = summarizer.build_digest(two_articles, client=client)
     assert copied not in digest.text
     assert "Переписано иначе." in digest.text
+
+
+# --------------------------------------------------------------------------- #
+# Выбор адреса API
+# --------------------------------------------------------------------------- #
+
+
+def test_make_client_uses_official_api_by_default(monkeypatch):
+    """Пустой ANTHROPIC_BASE_URL — обращаемся напрямую к Anthropic."""
+    # SDK сам читает одноимённую переменную окружения, поэтому убираем её:
+    # иначе тест зависел бы от настроек машины, на которой запущен.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(summarizer, "BASE_URL", "")
+    assert "api.anthropic.com" in str(summarizer.make_client().base_url)
+
+
+def test_make_client_honours_custom_base_url(monkeypatch):
+    """Непустой ANTHROPIC_BASE_URL — запросы идут через указанный шлюз."""
+    monkeypatch.setattr(summarizer, "BASE_URL", "https://gateway.example/")
+    assert "gateway.example" in str(summarizer.make_client().base_url)
+
+
+@pytest.mark.parametrize("factory", ["select_best", "request_digest"])
+def test_entry_points_build_client_via_make_client(monkeypatch, two_articles, factory):
+    """Ни одна точка входа не создаёт клиент в обход make_client."""
+    created = MagicMock()
+    created.messages.create.return_value = anthropic_message(
+        json.dumps({"selected_ids": [1], "title": "T", "intro": "I", "items": []})
+    )
+    monkeypatch.setattr(summarizer, "make_client", lambda: created)
+    # min_items=1: иначе select_best вернёт короткий список кандидатов, не спросив модель.
+    kwargs = {"min_items": 1} if factory == "select_best" else {}
+    try:
+        getattr(summarizer, factory)(two_articles, **kwargs)
+    except summarizer.SummarizerError:
+        pass  # пустой items — здесь неважно, проверяем источник клиента
+    assert created.messages.create.called
