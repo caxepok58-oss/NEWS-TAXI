@@ -53,14 +53,33 @@ def test_fetch_text_returns_empty_on_network_error(monkeypatch):
 
 def test_enrich_skips_aggregator_links(monkeypatch, article_factory):
     monkeypatch.setattr(extractor, "ENABLED", True)
-    monkeypatch.setattr(extractor, "fetch_text", lambda url, **kw: "ТЕКСТ")
+    monkeypatch.setattr(
+        extractor, "fetch_page", lambda url, **kw: ("ТЕКСТ", "https://penzaobzor.ru/1.jpg")
+    )
 
     direct = article_factory(url="https://penzaobzor.ru/1")
     aggregated = article_factory(url="https://news.google.com/rss/articles/CBMi1")
     extractor.enrich([direct, aggregated])
 
     assert direct.full_text == "ТЕКСТ"
+    assert direct.page_image_url == "https://penzaobzor.ru/1.jpg"
     assert aggregated.full_text == "", "у ссылки на агрегатор статьи нет"
+
+
+def test_extract_image_prefers_og_image():
+    html = """<head>
+      <meta name="twitter:image" content="https://a.ru/tw.jpg">
+      <meta content="/upload/photo.jpg?w=1200&amp;h=630" property="og:image" />
+    </head>"""
+    assert extractor.extract_image(html, "https://a.ru/news/1") == (
+        "https://a.ru/upload/photo.jpg?w=1200&h=630"
+    ), "порядок атрибутов любой, относительный адрес достраивается, &amp; раскрывается"
+
+
+def test_extract_image_falls_back_to_twitter_card():
+    html = '<meta name="twitter:image" content="https://a.ru/tw.jpg">'
+    assert extractor.extract_image(html) == "https://a.ru/tw.jpg"
+    assert extractor.extract_image("<p>без картинок</p>") == ""
 
 
 def test_enrich_is_noop_when_disabled(monkeypatch, article_factory):
@@ -147,10 +166,22 @@ def test_build_image_off_returns_none(article_factory):
     assert imagegen.build_image("Тест", [article_factory()], mode="off") is None
 
 
+def photo(width: int = 800, height: int = 500, fmt: str = "JPEG") -> bytes:
+    """Настоящее изображение нужного размера — prepare_photo его открывает."""
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (90, 120, 150)).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
 def test_build_image_source_mode_uses_feed_photo(monkeypatch, article_factory):
-    monkeypatch.setattr(imagegen, "download_image", lambda url: b"JPEGDATA" if url else None)
+    data = photo()
+    monkeypatch.setattr(imagegen, "download_image", lambda url: data if url else None)
     article = article_factory(image_url="https://a.ru/photo.jpg")
-    assert imagegen.build_image("Тест", [article], mode="source") == b"JPEGDATA"
+    assert imagegen.build_image("Тест", [article], mode="source") == data
 
 
 def test_build_image_source_mode_falls_back_to_cover(monkeypatch, article_factory):
@@ -193,3 +224,85 @@ def test_download_image_rejects_oversized(monkeypatch):
 
     monkeypatch.setattr(imagegen.requests, "get", lambda *a, **k: FakeResponse())
     assert imagegen.download_image("https://a.ru/big.jpg") is None
+
+
+# --------------------------------------------------------------------------- #
+# Картинки к отдельным постам
+# --------------------------------------------------------------------------- #
+
+
+def test_prepare_photo_keeps_normal_jpeg():
+    data = photo()
+    assert imagegen.prepare_photo(data) == data
+
+
+@pytest.mark.parametrize(
+    ("size", "why"),
+    [((120, 120), "иконка"), ((600, 150), "мелкая по высоте"), ((1500, 300), "баннер")],
+)
+def test_prepare_photo_rejects_non_photos(size, why):
+    assert imagegen.prepare_photo(photo(*size)) is None, why
+
+
+def test_prepare_photo_rejects_garbage():
+    assert imagegen.prepare_photo(b"<html>not an image</html>") is None
+    assert imagegen.prepare_photo(None) is None
+
+
+def test_prepare_photo_converts_webp_and_shrinks_huge():
+    from PIL import Image
+    import io
+
+    webp = imagegen.prepare_photo(photo(800, 500, "WEBP"))
+    assert Image.open(io.BytesIO(webp)).format == "JPEG", "WebP Telegram показывает не везде"
+
+    huge = imagegen.prepare_photo(photo(4000, 2500))
+    assert max(Image.open(io.BytesIO(huge)).size) <= imagegen.MAX_PHOTO_SIDE
+
+
+def test_news_images_prefers_page_photo(monkeypatch, article_factory):
+    page, feed = photo(900, 600), photo(800, 500)
+    urls = {"https://a.ru/page.jpg": page, "https://a.ru/feed.jpg": feed}
+    monkeypatch.setattr(imagegen, "download_image", urls.get)
+    article = article_factory(
+        page_image_url="https://a.ru/page.jpg", image_url="https://a.ru/feed.jpg"
+    )
+    assert imagegen.news_images([("Заголовок", article)], mode="source") == [page]
+
+
+def test_news_images_falls_back_to_feed_photo(monkeypatch, article_factory):
+    feed = photo()
+    urls = {"https://a.ru/feed.jpg": feed}
+    monkeypatch.setattr(imagegen, "download_image", urls.get)
+    article = article_factory(
+        page_image_url="https://a.ru/broken.jpg", image_url="https://a.ru/feed.jpg"
+    )
+    assert imagegen.news_images([("Заголовок", article)], mode="source") == [feed]
+
+
+def test_news_images_draws_card_without_photo(monkeypatch, article_factory):
+    monkeypatch.setattr(imagegen, "download_image", lambda url: None)
+    [card] = imagegen.news_images([("Заголовок", article_factory())], mode="source")
+    assert card is not None and card.startswith(b"\x89PNG")
+
+
+def test_news_images_does_not_reuse_site_logo(monkeypatch, article_factory):
+    """Один и тот же адрес у двух новостей — почти всегда заглушка сайта."""
+    logo = photo()
+    monkeypatch.setattr(imagegen, "download_image", lambda url: logo)
+    first = article_factory(title="Первая", page_image_url="https://a.ru/logo.png")
+    second = article_factory(title="Вторая", page_image_url="https://a.ru/logo.png")
+
+    images = imagegen.news_images([("Первая", first), ("Вторая", second)], mode="source")
+
+    assert images[0] == logo
+    assert images[1] != logo and images[1].startswith(b"\x89PNG")
+
+
+def test_news_images_off_mode(article_factory):
+    assert imagegen.news_images([("Заголовок", article_factory())], mode="off") == [None]
+
+
+def test_card_footer_fits_with_long_source(article_factory):
+    article = article_factory(source="Очень длинное название издания " * 5)
+    assert imagegen.render_card("Заголовок новости", article).startswith(b"\x89PNG")

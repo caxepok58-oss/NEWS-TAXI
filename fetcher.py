@@ -285,6 +285,9 @@ class Article:
     keywords: tuple[str, ...] = field(default_factory=tuple)
     image_url: str = ""  # картинка из вложения ленты, если есть
     full_text: str = ""  # текст статьи, дочитывается в extractor.py
+    # Главное фото со страницы статьи (og:image), дочитывается в extractor.py.
+    # Обычно крупнее и точнее картинки из ленты, у которой бывает миниатюра.
+    page_image_url: str = ""
 
     @property
     def body(self) -> str:

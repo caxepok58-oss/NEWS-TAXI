@@ -237,3 +237,46 @@ async def test_send_notice_survives_failure():
     bot.send_message = AsyncMock(side_effect=TelegramError("заблокирован"))
     await sender.send_notice(bot, [1, 2], "текст")  # не должно бросить
     assert bot.send_message.await_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# Отдельный пост
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_send_post_sends_photo_with_button():
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.send_message = AsyncMock()
+
+    await sender.send_post(
+        bot, "-100", "<b>Новость</b>", image=b"IMG", buttons=[("Читать", "https://a.ru")], silent=True
+    )
+
+    kwargs = bot.send_photo.await_args.kwargs
+    assert kwargs["caption"] == "<b>Новость</b>" and kwargs["photo"] == b"IMG"
+    assert kwargs["reply_markup"] is not None
+    assert kwargs["disable_notification"] is True
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_post_falls_back_to_text_when_photo_fails():
+    """Новость важнее картинки: фото не ушло — публикуем текст."""
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(side_effect=TelegramError("wrong file"))
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=2))
+
+    await sender.send_post(bot, "-100", "<b>Новость</b>", image=b"IMG")
+
+    assert bot.send_message.await_args.kwargs["text"] == "<b>Новость</b>"
+
+
+@pytest.mark.asyncio
+async def test_send_post_without_image_sends_text():
+    bot = MagicMock()
+    bot.send_photo = AsyncMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=3))
+    await sender.send_post(bot, "-100", "текст")
+    bot.send_photo.assert_not_awaited()

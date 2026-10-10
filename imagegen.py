@@ -2,16 +2,18 @@
 
 Три режима, задаются переменной IMAGE_MODE:
 
-* ``cover``  — обложка выпуска рисуется локально через Pillow (по умолчанию).
-               Ключей не требует, работает всегда.
+* ``cover``  — обложка выпуска (или карточка новости) рисуется локально
+               через Pillow. Ключей не требует, работает всегда.
 * ``ai``     — иллюстрация генерируется нейросетью Kandinsky (FusionBrain API)
                по описанию, которое составила модель. Нужны ключи
                FUSIONBRAIN_API_KEY и FUSIONBRAIN_SECRET_KEY (бесплатные).
-* ``source`` — берётся фотография из вложения RSS у главной новости выпуска.
+* ``source`` — реальное фото издания (по умолчанию): со страницы статьи
+               (og:image) или из вложения RSS. В режиме отдельных постов —
+               своё фото у каждой новости.
 * ``off``    — пост отправляется без картинки.
 
-Любой сбой в режимах ``ai`` и ``source`` откатывается на локальную обложку,
-чтобы выпуск не остался без изображения.
+Любой сбой в режимах ``ai`` и ``source`` откатывается на локальную обложку
+или карточку, чтобы пост не остался без изображения.
 
 Anthropic API изображения не генерирует — Claude умеет только писать описание
 сцены, поэтому за саму картинку отвечает либо Pillow, либо внешний сервис.
@@ -33,7 +35,7 @@ from fetcher import TOPIC_TITLES, Article
 
 log = logging.getLogger(__name__)
 
-MODE = os.getenv("IMAGE_MODE", "cover").strip().lower()
+MODE = os.getenv("IMAGE_MODE", "source").strip().lower()
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
 USER_AGENT = os.getenv(
@@ -124,8 +126,13 @@ def render_cover(
     title: str,
     articles: Sequence[Article] = (),
     when: datetime | None = None,
+    footer: str | None = None,
 ) -> bytes | None:
-    """Рисует обложку выпуска: дата, заголовок и темы. Возвращает PNG."""
+    """Рисует обложку выпуска: дата, заголовок и темы. Возвращает PNG.
+
+    footer заменяет нижнюю строку с темами — так рисуется карточка
+    отдельной новости, у которой «Такси — 1» смотрелось бы странно.
+    """
     try:
         from PIL import Image, ImageDraw
     except ImportError:  # pragma: no cover - Pillow не установлен
@@ -177,8 +184,8 @@ def render_cover(
     counts: dict[str, int] = {}
     for article in articles:
         counts[article.topic] = counts.get(article.topic, 0) + 1
-    if counts:
-        parts = [
+    if footer or counts:
+        parts = [footer] if footer else [
             f"{_SHORT_TOPICS.get(topic) or TOPIC_TITLES[topic].split(' ', 1)[-1]} — {count}"
             for topic, count in counts.items()
             if topic in TOPIC_TITLES
@@ -190,7 +197,11 @@ def render_cover(
             topic_font = _font(topic_size, bold=False)
             if draw.textlength(line, font=topic_font) <= text_width:
                 break
-        while parts and draw.textlength(line, font=topic_font) > text_width:
+        if footer and draw.textlength(line, font=topic_font) > text_width:
+            while len(line) > 1 and draw.textlength(line + "…", font=topic_font) > text_width:
+                line = line[:-1]
+            line = line.rstrip() + "…"
+        while not footer and parts and draw.textlength(line, font=topic_font) > text_width:
             parts.pop()
             line = "   ·   ".join(parts) + "   ·   …"
         draw.text(
@@ -337,10 +348,11 @@ def build_image(
 
     if mode == "source":
         for article in articles:
-            data = download_image(article.image_url)
-            if data:
-                log.info("Использую фото из ленты: %s", article.source)
-                return data
+            for url in _photo_candidates(article):
+                data = prepare_photo(download_image(url))
+                if data:
+                    log.info("Использую фото издания: %s", article.source)
+                    return data
         log.info("Подходящего фото в лентах нет — рисую обложку")
 
     elif mode == "ai":
@@ -358,3 +370,107 @@ def build_image(
     except Exception as exc:  # noqa: BLE001 - картинка не должна ронять выпуск
         log.warning("Не удалось нарисовать обложку: %s", exc)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Картинки к отдельным постам
+# --------------------------------------------------------------------------- #
+
+# Меньше этого — миниатюра или иконка: в ленте Telegram она расплывётся.
+MIN_PHOTO_WIDTH, MIN_PHOTO_HEIGHT = 400, 220
+# Вытянутые картинки — это баннеры и шапки сайтов, а не фото события.
+MAX_PHOTO_RATIO = 3.0
+# Крупнее не нужно: Telegram всё равно сожмёт, а загрузка дольше.
+MAX_PHOTO_SIDE = 1920
+
+
+def prepare_photo(data: bytes | None) -> bytes | None:
+    """Проверяет, что это годное фото, и приводит его к виду, удобному Telegram.
+
+    Отсекает иконки, логотипы-миниатюры и баннеры; WebP, GIF и огромные
+    снимки пересохраняет в JPEG.
+    """
+    if not data:
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception as exc:  # noqa: BLE001 - битый файл или не картинка
+        log.debug("Картинка не читается: %s", exc)
+        return None
+
+    width, height = image.size
+    if width < MIN_PHOTO_WIDTH or height < MIN_PHOTO_HEIGHT:
+        log.debug("Картинка слишком мелкая: %dx%d", width, height)
+        return None
+    if max(width, height) / min(width, height) > MAX_PHOTO_RATIO:
+        log.debug("Картинка похожа на баннер: %dx%d", width, height)
+        return None
+
+    if image.format in ("JPEG", "PNG") and max(width, height) <= MAX_PHOTO_SIDE:
+        return data
+    image = image.convert("RGB")
+    image.thumbnail((MAX_PHOTO_SIDE, MAX_PHOTO_SIDE))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=88)
+    return buffer.getvalue()
+
+
+def _photo_candidates(article: Article) -> list[str]:
+    """Адреса фото новости в порядке надёжности: страница статьи, затем лента."""
+    seen: list[str] = []
+    for url in (article.page_image_url, article.image_url):
+        if url and url not in seen:
+            seen.append(url)
+    return seen
+
+
+def render_card(headline: str, article: Article) -> bytes | None:
+    """Карточка новости — когда своего фото у неё нет."""
+    topic = _SHORT_TOPICS.get(article.topic, "")
+    footer = " · ".join(part for part in (topic, article.source) if part)
+    try:
+        return render_cover(headline, footer=footer)
+    except Exception as exc:  # noqa: BLE001 - картинка не должна ронять выпуск
+        log.warning("Не удалось нарисовать карточку: %s", exc)
+        return None
+
+
+def news_images(
+    items: Sequence[tuple[str, Article]], mode: str | None = None
+) -> list[bytes | None]:
+    """Картинки к отдельным постам — по одной на новость, в том же порядке.
+
+    items — пары (заголовок поста, новость). В режиме source берётся фото
+    издания; если его нет или это явно не фото события — рисуется карточка.
+    Одна и та же картинка у нескольких новостей почти всегда логотип или
+    заглушка сайта, поэтому повторно она не используется.
+    """
+    mode = (mode or MODE).lower()
+    if mode == "off":
+        return [None] * len(items)
+
+    images: list[bytes | None] = []
+    used: set[str] = set()
+    own = 0
+    for headline, article in items:
+        data = None
+        if mode == "source":
+            for url in _photo_candidates(article):
+                if url in used:
+                    continue
+                data = prepare_photo(download_image(url))
+                if data:
+                    used.add(url)
+                    break
+        elif mode == "ai":
+            data = generate_image(f"фотореалистичная сцена к новости: {headline}")
+        elif mode != "cover":
+            log.warning("Неизвестный IMAGE_MODE=%r, рисую карточку", mode)
+        own += bool(data)
+        images.append(data or render_card(headline, article))
+
+    log.info("Картинки к постам: своих %d из %d, остальным — карточки", own, len(items))
+    return images

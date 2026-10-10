@@ -628,3 +628,68 @@ def test_check_flags_other_model(asked, answered, differs):
         summarizer.Provider("основной", "", "", asked), reported_model=answered
     )
     assert check.model_differs is differs
+
+
+# --------------------------------------------------------------------------- #
+# Отдельные посты
+# --------------------------------------------------------------------------- #
+
+
+def test_digest_items_follow_post_order(article_factory):
+    """Порядок постов тот же, что в общем выпуске: по темам, а не как ответила модель."""
+    articles = [
+        article_factory(title="Пожар", topic=TOPIC_INCIDENT),
+        article_factory(title="Такси", topic=TOPIC_TAXI),
+        article_factory(title="Авто", topic=TOPIC_AUTO),
+    ]
+    data = {
+        "items": [
+            {"id": 1, "headline": "П", "summary": "п"},
+            {"id": 3, "headline": "А", "summary": "а"},
+            {"id": 2, "headline": "Т", "summary": "т"},
+            {"id": 99, "headline": "лишний", "summary": "нет такой новости"},
+        ]
+    }
+    items = summarizer.digest_items(data, articles)
+    assert [i.article.title for i in items] == ["Такси", "Авто", "Пожар"]
+
+
+def test_build_digest_fills_items(two_articles):
+    digest = summarizer.build_digest(two_articles, client=client_returning(DIGEST_PAYLOAD))
+    assert [i.headline for i in digest.items] == ["Список такси расширили", "Кроссовер сняли с выпуска"]
+    assert digest.items[0].summary == "Добавили шесть моделей."
+
+
+def test_render_item_buttons_mode(article_factory):
+    article = article_factory(title="Исходный", topic=TOPIC_TAXI, source="Пенза-Обзор")
+    item = summarizer.DigestItem(article, "Новые правила <для> такси", "Описание & детали.")
+
+    caption, buttons = summarizer.render_item(item, links_mode="buttons")
+
+    assert caption.startswith("<b>Новые правила &lt;для&gt; такси</b>")
+    assert "Описание &amp; детали." in caption
+    assert "<i>Пенза-Обзор</i>" in caption and "Рынок такси" in caption
+    assert buttons == [("Читать в источнике", article.url)]
+
+
+def test_render_item_inline_mode(article_factory):
+    article = article_factory(url="https://a.ru/1?x=1&y=2", source="Источник")
+    caption, buttons = summarizer.render_item(
+        summarizer.DigestItem(article, "Заголовок", "Текст."), links_mode="inline"
+    )
+    assert '<a href="https://a.ru/1?x=1&amp;y=2">Источник</a>' in caption
+    assert buttons == []
+
+
+def test_render_item_fits_photo_caption(article_factory):
+    """Подпись к фото ограничена 1024 символами — длинный пересказ обрезается по слову."""
+    item = summarizer.DigestItem(article_factory(), "Заголовок", "очень длинный текст " * 200)
+    caption, _ = summarizer.render_item(item)
+    assert len(caption) <= summarizer.CAPTION_LIMIT
+    assert "текст…" in caption or "длинный…" in caption or "очень…" in caption
+
+
+def test_render_item_without_summary(article_factory):
+    """Описание, убранное как копия источника, не оставляет пустых строк."""
+    caption, _ = summarizer.render_item(summarizer.DigestItem(article_factory(), "Заголовок", ""))
+    assert "\n\n\n" not in caption and caption.count("\n\n") == 1

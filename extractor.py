@@ -1,4 +1,4 @@
-"""Извлечение основного текста статьи со страницы издания.
+"""Извлечение основного текста и главного фото статьи со страницы издания.
 
 Описания в RSS часто состоят из одной фразы, а у лент Google Новостей их нет
 вовсе. Без полного текста пересказ получается бедным не из-за модели, а из-за
@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from typing import Sequence
+from urllib.parse import urljoin
 
 import requests
 
@@ -72,8 +73,36 @@ def extract_from_html(html: str, limit: int = MAX_TEXT_LEN) -> str:
     return " ".join(paragraphs)[:limit].strip()
 
 
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_META_NAME = re.compile(r"""(?:property|name)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_META_CONTENT = re.compile(r"""content\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+# Чем раньше в списке, тем надёжнее: og:image издания ставят на главное фото.
+_IMAGE_META = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
+
+
+def extract_image(html: str, base_url: str = "") -> str:
+    """Главная картинка статьи из метатегов страницы (og:image и twitter:image)."""
+    found: dict[str, str] = {}
+    for tag in _META_TAG.findall(html[:300_000]):
+        name = _META_NAME.search(tag)
+        content = _META_CONTENT.search(tag)
+        if name and content:
+            key = name.group(1).strip().lower()
+            if key in _IMAGE_META and key not in found:
+                found[key] = unescape(content.group(1).strip())
+    for key in _IMAGE_META:
+        if found.get(key):
+            return urljoin(base_url, found[key])
+    return ""
+
+
 def fetch_text(url: str, limit: int = MAX_TEXT_LEN) -> str:
     """Возвращает основной текст статьи или пустую строку, если не получилось."""
+    return fetch_page(url, limit)[0]
+
+
+def fetch_page(url: str, limit: int = MAX_TEXT_LEN) -> tuple[str, str]:
+    """Текст статьи и адрес её главной картинки. Пустые строки, если не вышло."""
     try:
         response = requests.get(
             url,
@@ -83,12 +112,13 @@ def fetch_text(url: str, limit: int = MAX_TEXT_LEN) -> str:
         response.raise_for_status()
     except requests.RequestException as exc:
         log.debug("Не удалось загрузить %s: %s", url, exc)
-        return ""
+        return "", ""
 
     # Кодировку из заголовков сайты указывают неверно чаще, чем в самой странице.
     if response.encoding and response.encoding.lower() == "iso-8859-1":
         response.encoding = response.apparent_encoding
     html = response.text
+    image = extract_image(html, response.url or url)
 
     if _HAS_TRAFILATURA:
         try:
@@ -99,11 +129,11 @@ def fetch_text(url: str, limit: int = MAX_TEXT_LEN) -> str:
                 favor_precision=True,
             )
             if text:
-                return re.sub(r"\s+", " ", text).strip()[:limit]
+                return re.sub(r"\s+", " ", text).strip()[:limit], image
         except Exception as exc:  # noqa: BLE001 - падение парсера не критично
             log.debug("trafilatura не справилась с %s: %s", url, exc)
 
-    return extract_from_html(html, limit=limit)
+    return extract_from_html(html, limit=limit), image
 
 
 def enrich(articles: Sequence[Article], workers: int = 4) -> list[Article]:
@@ -120,7 +150,7 @@ def enrich(articles: Sequence[Article], workers: int = 4) -> list[Article]:
         # У ссылок на агрегатор нет статьи как таковой — там редирект.
         if "news.google.com" in article.url:
             return
-        article.full_text = fetch_text(article.url)
+        article.full_text, article.page_image_url = fetch_page(article.url)
 
     with ThreadPoolExecutor(max_workers=min(workers, len(articles))) as pool:
         list(pool.map(worker, articles))

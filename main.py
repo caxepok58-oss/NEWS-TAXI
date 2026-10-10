@@ -73,6 +73,12 @@ MISFIRE_GRACE_MINUTES = int(os.getenv("MISFIRE_GRACE_MINUTES", "60"))
 CATCH_UP_MISSED = os.getenv("CATCH_UP_MISSED", "1") not in ("0", "false", "False", "")
 # Закреплять утренний дайджест в чате (нужны права администратора).
 PIN_DIGEST = os.getenv("PIN_DIGEST", "1") not in ("0", "false", "False", "")
+# separate — каждая новость отдельным постом со своей картинкой;
+# digest   — один пост-подборка с обложкой.
+POST_MODE = os.getenv("POST_MODE", "separate").strip().lower()
+# Пауза между отдельными постами: Telegram ограничивает частоту сообщений
+# в группах, а восемь постов за секунду выглядят как спам.
+POST_PAUSE_SECONDS = float(os.getenv("POST_PAUSE_SECONDS", "3"))
 
 # --- Предпросмотр ---------------------------------------------------------
 # Показывать выпуск администратору и ждать подтверждения перед публикацией.
@@ -230,6 +236,25 @@ class BuildResult:
     feed_alerts: list[tuple[str, int, str]] = field(default_factory=list)
 
 
+def _separate_posts(digest: summarizer.Digest) -> bool:
+    """Публиковать ли выпуск отдельными постами (иначе — одним)."""
+    return POST_MODE == "separate" and bool(digest.items)
+
+
+def _prepare_images(digest: summarizer.Digest) -> bytes | None:
+    """Картинки к выпуску. Возвращает обложку для общего поста.
+
+    В режиме отдельных постов картинки раскладываются по digest.items,
+    а обложка не нужна.
+    """
+    if not _separate_posts(digest):
+        return imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
+    images = imagegen.news_images([(item.headline, item.article) for item in digest.items])
+    for item, image in zip(digest.items, images):
+        item.image = image
+    return None
+
+
 def _build_digest_blocking() -> BuildResult:
     """Синхронная часть прогона. digest=None — если публиковать нечего.
 
@@ -262,7 +287,7 @@ def _build_digest_blocking() -> BuildResult:
 
         extractor.enrich(selected)
         digest = summarizer.build_digest(selected)
-        image = imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
+        image = _prepare_images(digest)
         return BuildResult(digest=digest, image=image, feed_alerts=alerts)
     finally:
         conn.close()
@@ -299,6 +324,60 @@ def _mark_blocking(articles: list[fetcher.Article], status: str, details: str = 
         conn.close()
 
 
+class PartialPublish(Exception):
+    """Публикация оборвалась на середине; published — что успело уйти."""
+
+    def __init__(self, published: list[fetcher.Article], cause: Exception):
+        super().__init__(str(cause))
+        self.published = published
+        self.cause = cause
+
+
+async def publish(
+    bot: Bot,
+    chat_id: str | int,
+    digest: summarizer.Digest,
+    image: bytes | None,
+    *,
+    pin: bool = False,
+) -> list[fetcher.Article]:
+    """Публикует выпуск по POST_MODE и возвращает новости, которые ушли.
+
+    Отдельные посты идут с паузой, звенит только первый. Если отправка
+    оборвалась, PartialPublish несёт уже опубликованные новости: их надо
+    пометить, иначе повтор продублирует их в канале.
+    """
+    if not _separate_posts(digest):
+        previous_pin = await asyncio.to_thread(_pinned_id) if pin else None
+        sent = await sender.send_digest(
+            bot,
+            chat_id,
+            digest.text,
+            image=image,
+            buttons=digest.buttons,
+            pin=pin,
+            unpin=previous_pin,
+        )
+        if pin and getattr(sent, "pinned_id", None):
+            await asyncio.to_thread(_remember_pinned, sent.pinned_id)
+        return list(digest.articles)
+
+    published: list[fetcher.Article] = []
+    for index, item in enumerate(digest.items):
+        if index:
+            await asyncio.sleep(POST_PAUSE_SECONDS)
+        caption, buttons = summarizer.render_item(item)
+        try:
+            await sender.send_post(
+                bot, chat_id, caption, image=item.image, buttons=buttons, silent=index > 0
+            )
+        except Exception as exc:  # noqa: BLE001 - отдаём наверх вместе с ушедшими
+            raise PartialPublish(published, exc) from exc
+        published.append(item.article)
+    log.info("Опубликовано отдельными постами: %d в %s", len(published), chat_id)
+    return published
+
+
 def _preview_available(job_queue) -> bool:
     """Можно ли отправить выпуск на подтверждение.
 
@@ -314,6 +393,33 @@ def _preview_available(job_queue) -> bool:
         log.warning("Предпросмотр недоступен без планировщика — публикую сразу")
         return False
     return True
+
+
+def _save_preview(path: str, image: bytes) -> str:
+    with open(path, "wb") as handle:
+        handle.write(image)
+    return f"[картинка сохранена: {path}, {len(image) // 1024} КБ]"
+
+
+def _print_dry_run(digest: summarizer.Digest, image: bytes | None) -> None:
+    """Печатает выпуск так, как он уйдёт в канал, и сохраняет картинки."""
+    path = os.getenv("DRY_RUN_IMAGE", "digest-preview.png")
+    if not _separate_posts(digest):
+        print(digest.text)
+        if image:
+            print("\n" + _save_preview(path, image))
+        return
+
+    stem, ext = os.path.splitext(path)
+    for number, item in enumerate(digest.items, start=1):
+        caption, buttons = summarizer.render_item(item)
+        print(f"===== Пост {number} из {len(digest.items)} =====")
+        print(caption)
+        for label, url in buttons:
+            print(f"[кнопка «{label}»: {url}]")
+        if item.image:
+            print(_save_preview(f"{stem}-{number}{ext or '.png'}", item.image))
+        print()
 
 
 async def run_digest(
@@ -353,12 +459,7 @@ async def run_digest(
 
         digest, image = result.digest, result.image
         if dry_run:
-            print(digest.text)
-            if image:
-                path = os.getenv("DRY_RUN_IMAGE", "digest-preview.png")
-                with open(path, "wb") as handle:
-                    handle.write(image)
-                print(f"\n[картинка сохранена: {path}, {len(image) // 1024} КБ]")
+            _print_dry_run(digest, image)
             log.info(
                 "Dry-run: пост собран (%d новостей), отправка пропущена",
                 len(digest.articles),
@@ -381,30 +482,22 @@ async def run_digest(
             )
 
         try:
-            previous_pin = await asyncio.to_thread(_pinned_id) if PIN_DIGEST else None
-            sent = await sender.send_digest(
-                bot,
-                chat_id,
-                digest.text,
-                image=image,
-                buttons=digest.buttons,
-                pin=PIN_DIGEST,
-                unpin=previous_pin,
-            )
-            if getattr(sent, "pinned_id", None):
-                await asyncio.to_thread(_remember_pinned, sent.pinned_id)
+            published = await publish(bot, chat_id, digest, image, pin=PIN_DIGEST)
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось отправить дайджест")
-            await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
+            # Ушедшие посты помечаем, чтобы повтор не продублировал их в канале.
+            sent = exc.published if isinstance(exc, PartialPublish) else []
+            await asyncio.to_thread(_mark_blocking, sent, "send_error", repr(exc))
+            done = f" (успело уйти {len(sent)} из {len(digest.articles)})" if sent else ""
             return RunResult(
-                False, f"дайджест собран, но не отправлен: {exc}", retryable=True
+                False, f"дайджест собран, но не отправлен{done}: {exc}", retryable=True
             )
 
         # Помечаем опубликованным только после успешной отправки.
-        await asyncio.to_thread(_mark_blocking, digest.articles, "ok")
+        await asyncio.to_thread(_mark_blocking, published, "ok")
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        log.info("=== Готово: %d новостей за %.1f с ===", len(digest.articles), elapsed)
-        return RunResult(True, f"дайджест отправлен: {len(digest.articles)} новостей")
+        log.info("=== Готово: %d новостей за %.1f с ===", len(published), elapsed)
+        return RunResult(True, f"дайджест отправлен: {len(published)} новостей")
 
 
 def _breaking_blocking() -> tuple[summarizer.Digest, bytes | None] | None:
@@ -435,8 +528,7 @@ def _breaking_blocking() -> tuple[summarizer.Digest, bytes | None] | None:
         log.info("Найдена срочная новость: %s", urgent[0].title[:90])
         extractor.enrich(urgent[:1])
         digest = summarizer.build_digest(urgent[:1])
-        image = imagegen.build_image(digest.title, digest.articles, digest.image_prompt)
-        return digest, image
+        return digest, _prepare_images(digest)
     finally:
         conn.close()
 
@@ -460,9 +552,7 @@ async def run_breaking(bot: Bot, chat_id: str | int) -> RunResult:
 
         digest, image = found
         try:
-            await sender.send_digest(
-                bot, chat_id, digest.text, image=image, buttons=digest.buttons
-            )
+            await publish(bot, chat_id, digest, image)
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось отправить срочную новость")
             return RunResult(False, f"срочная новость не отправлена: {exc}")
@@ -505,9 +595,7 @@ async def send_preview(bot: Bot, digest: summarizer.Digest, image: bytes | None)
     )
     for admin_id in sorted(ADMIN_USER_IDS):
         await sender.send_notice(bot, [admin_id], head)
-        await sender.send_digest(
-            bot, admin_id, digest.text, image=image, buttons=digest.buttons
-        )
+        await publish(bot, admin_id, digest, image)
         await bot.send_message(
             chat_id=admin_id,
             text=f"Публикуем? Без ответа через {PREVIEW_TIMEOUT_MINUTES} мин — "
@@ -525,26 +613,16 @@ async def publish_pending(bot: Bot, key: str, reason: str = "") -> RunResult:
 
     digest = pending.digest
     try:
-        previous_pin = await asyncio.to_thread(_pinned_id) if PIN_DIGEST else None
-        sent = await sender.send_digest(
-            bot,
-            CHAT_ID,
-            digest.text,
-            image=pending.image,
-            buttons=digest.buttons,
-            pin=PIN_DIGEST,
-            unpin=previous_pin,
-        )
-        if getattr(sent, "pinned_id", None):
-            await asyncio.to_thread(_remember_pinned, sent.pinned_id)
+        published = await publish(bot, CHAT_ID, digest, pending.image, pin=PIN_DIGEST)
     except Exception as exc:  # noqa: BLE001
         log.exception("Не удалось отправить подтверждённый выпуск")
-        await asyncio.to_thread(_mark_blocking, [], "send_error", repr(exc))
+        sent = exc.published if isinstance(exc, PartialPublish) else []
+        await asyncio.to_thread(_mark_blocking, sent, "send_error", repr(exc))
         return RunResult(False, f"выпуск не отправлен: {exc}", retryable=True)
 
-    await asyncio.to_thread(_mark_blocking, digest.articles, "ok")
-    log.info("Выпуск опубликован%s: %d новостей", reason, len(digest.articles))
-    return RunResult(True, f"дайджест отправлен: {len(digest.articles)} новостей")
+    await asyncio.to_thread(_mark_blocking, published, "ok")
+    log.info("Выпуск опубликован%s: %d новостей", reason, len(published))
+    return RunResult(True, f"дайджест отправлен: {len(published)} новостей")
 
 
 async def on_preview_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

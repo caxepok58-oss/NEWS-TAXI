@@ -257,7 +257,7 @@ async def test_breaking_publishes_and_marks(digest):
 
     assert result.ok and "срочная" in result.message
     send.assert_awaited_once()
-    assert send.await_args.kwargs.get("pin") is None, "срочные посты не закрепляем"
+    assert not send.await_args.kwargs.get("pin"), "срочные посты не закрепляем"
 
     conn = fetcher.connect()
     assert fetcher.is_published(conn, digest.articles[0])
@@ -771,3 +771,123 @@ def test_fallback_key_is_redacted_in_logs(monkeypatch, tmp_path):
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
     assert "sk-fallback-secret-123" not in (tmp_path / "bot.log").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Каждая новость — отдельным постом
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def separate(monkeypatch):
+    monkeypatch.setattr(main, "POST_MODE", "separate")
+    monkeypatch.setattr(main, "POST_PAUSE_SECONDS", 0)
+
+
+@pytest.fixture
+def three_news(article_factory):
+    articles = [article_factory(title=f"Новость {n}") for n in (1, 2, 3)]
+    items = [
+        summarizer.DigestItem(a, f"Заголовок {n}", f"Пересказ {n}.", image=f"IMG{n}".encode())
+        for n, a in enumerate(articles, start=1)
+    ]
+    return summarizer.Digest(
+        text="<b>общий пост</b>", articles=articles, title="Выпуск", items=items
+    )
+
+
+@pytest.mark.asyncio
+async def test_separate_mode_posts_each_news_with_its_photo(separate, three_news):
+    import fetcher
+
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(three_news)), patch.object(
+        main.sender, "send_post", new=AsyncMock()
+    ) as post, patch.object(main.sender, "send_digest", new=AsyncMock()) as digest_send:
+        result = await main.run_digest(_bot(), "-100")
+
+    assert result.ok and "3 новостей" in result.message
+    digest_send.assert_not_awaited()
+    assert post.await_count == 3
+    calls = post.await_args_list
+    assert [c.kwargs["image"] for c in calls] == [b"IMG1", b"IMG2", b"IMG3"]
+    assert "Заголовок 1" in calls[0].args[2]
+    assert [c.kwargs["silent"] for c in calls] == [False, True, True], "звенит только первый"
+    conn = fetcher.connect()
+    assert all(fetcher.is_published(conn, a) for a in three_news.articles)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_separate_mode_marks_what_was_sent_before_failure(separate, three_news):
+    """Оборвалось на третьем посте — первые два не должны выйти повторно."""
+    import fetcher
+
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(three_news)), patch.object(
+        main.sender, "send_post", new=AsyncMock(side_effect=[None, None, RuntimeError("нет сети")])
+    ):
+        result = await main.run_digest(_bot(), "-100")
+
+    assert not result.ok and result.retryable
+    assert "2 из 3" in result.message
+    conn = fetcher.connect()
+    published = [fetcher.is_published(conn, a) for a in three_news.articles]
+    conn.close()
+    assert published == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_separate_mode_does_not_pin(separate, three_news, monkeypatch):
+    monkeypatch.setattr(main, "PIN_DIGEST", True)
+    bot = _bot()
+    bot.pin_chat_message = AsyncMock()
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(three_news)), patch.object(
+        main.sender, "send_post", new=AsyncMock()
+    ):
+        await main.run_digest(bot, "-100")
+    bot.pin_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_digest_mode_still_sends_one_post(monkeypatch, three_news):
+    monkeypatch.setattr(main, "POST_MODE", "digest")
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(three_news, b"COVER")), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ) as send, patch.object(main.sender, "send_post", new=AsyncMock()) as post:
+        result = await main.run_digest(_bot(), "-100")
+    assert result.ok
+    send.assert_awaited_once()
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_separate_dry_run_saves_image_per_post(separate, three_news, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DRY_RUN_IMAGE", str(tmp_path / "preview.png"))
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(three_news)), patch.object(
+        main.sender, "send_post", new=AsyncMock()
+    ) as post:
+        result = await main.run_digest(None, "-100", dry_run=True)
+
+    assert result.ok
+    post.assert_not_awaited()
+    out = capsys.readouterr().out
+    assert "Пост 1 из 3" in out and "Заголовок 3" in out and "Читать в источнике" in out
+    assert (tmp_path / "preview-2.png").read_bytes() == b"IMG2"
+
+
+@pytest.mark.asyncio
+async def test_separate_preview_shows_every_post_to_admin(separate, three_news, monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+    bot = _bot()
+    with patch.object(main.sender, "send_post", new=AsyncMock()) as post:
+        key = await main.send_preview(bot, three_news, None)
+    assert post.await_count == 3
+    assert all(c.args[1] == 42 for c in post.await_args_list), "предпросмотр — только админу"
+    main._pending.pop(key, None)
+
+
+def test_prepare_images_attaches_photo_to_each_item(separate, three_news, monkeypatch):
+    for item in three_news.items:
+        item.image = None
+    monkeypatch.setattr(main.imagegen, "news_images", lambda items: [b"A", b"B", None])
+    assert main._prepare_images(three_news) is None, "общая обложка в этом режиме не нужна"
+    assert [i.image for i in three_news.items] == [b"A", b"B", None]

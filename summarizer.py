@@ -55,6 +55,8 @@ LINKS_MODE = os.getenv("LINKS_MODE", "buttons").strip().lower()
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 # Длина совпадающей цепочки слов, после которой пересказ считается копией.
 COPY_NGRAM = int(os.getenv("COPY_NGRAM", "7"))
+# Подпись к фото в Telegram ограничена 1024 символами — берём с запасом.
+CAPTION_LIMIT = 1000
 
 # --------------------------------------------------------------------------- #
 # Промпты и схемы
@@ -808,6 +810,16 @@ def render(
 
 
 @dataclass
+class DigestItem:
+    """Одна новость выпуска — для публикации отдельным постом."""
+
+    article: Article
+    headline: str
+    summary: str
+    image: bytes | None = None
+
+
+@dataclass
 class Digest:
     """Готовый выпуск: текст поста, кнопки, вошедшие новости и данные обложки."""
 
@@ -816,6 +828,62 @@ class Digest:
     title: str
     image_prompt: str = ""
     buttons: list[tuple[str, str]] = field(default_factory=list)
+    # Те же новости по одной, в порядке поста: по темам, внутри темы — по id.
+    items: list[DigestItem] = field(default_factory=list)
+
+
+def digest_items(data: dict, articles: Sequence[Article]) -> list[DigestItem]:
+    """Новости выпуска по одной — в том же порядке, что и в общем посте."""
+    by_id = {index: article for index, article in enumerate(articles, start=1)}
+    found: dict[int, dict] = {}
+    for item in data.get("items", []):
+        try:
+            item_id = int(item["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item_id in by_id:
+            found[item_id] = item
+
+    ordered = sorted(found, key=lambda i: (TOPIC_ORDER.index(by_id[i].topic), i))
+    return [
+        DigestItem(
+            article=by_id[i],
+            headline=str(found[i].get("headline") or by_id[i].title).strip(),
+            summary=str(found[i].get("summary") or "").strip(),
+        )
+        for i in ordered
+    ]
+
+
+def render_item(
+    item: DigestItem, links_mode: str | None = None
+) -> tuple[str, list[tuple[str, str]]]:
+    """Отдельный пост о новости: заголовок, пересказ, тема и источник.
+
+    Пост уходит подписью к фото, а у неё лимит 1024 символа, поэтому
+    слишком длинный пересказ обрезается по слову.
+    """
+    links_mode = (links_mode or LINKS_MODE).lower()
+    article = item.article
+    headline = escape(item.headline)
+    topic = escape(TOPIC_TITLES.get(article.topic, ""))
+    if links_mode == "buttons":
+        source = f"<i>{escape(article.source)}</i>"
+        buttons = [("Читать в источнике", article.url)]
+    else:
+        source = f'<a href="{escape(article.url, quote=True)}">{escape(article.source)}</a>'
+        buttons = []
+    footer = f"{topic} · {source}" if topic else source
+
+    budget = CAPTION_LIMIT - len(headline) - len(footer) - 20
+    summary = item.summary
+    if len(summary) > budget:
+        summary = summary[: max(budget, 0)].rsplit(" ", 1)[0].rstrip(",.;:—- ") + "…"
+    parts = [f"<b>{headline}</b>"]
+    if summary.strip("…"):
+        parts.append(escape(summary))
+    parts.append(footer)
+    return "\n\n".join(parts), buttons
 
 
 def build_digest(
@@ -841,4 +909,5 @@ def build_digest(
         title=str(data.get("title") or "Новостной дайджест").strip(),
         image_prompt=str(data.get("image_prompt") or "").strip(),
         buttons=buttons,
+        items=digest_items(data, articles),
     )

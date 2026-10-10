@@ -107,6 +107,7 @@ async def _send_one(
     chat_id: str | int,
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    silent: bool = False,
 ):
     """Отправляет одно сообщение. Возвращает объект сообщения или None."""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -117,6 +118,7 @@ async def _send_one(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=reply_markup,
+                disable_notification=silent,
             )
         except RetryAfter as exc:
             wait = float(getattr(exc, "retry_after", 5))
@@ -130,6 +132,7 @@ async def _send_one(
                 text=_strip_html(text),
                 disable_web_page_preview=True,
                 reply_markup=reply_markup,
+                disable_notification=silent,
             )
         except TelegramError as exc:
             if attempt == MAX_RETRIES:
@@ -145,6 +148,7 @@ async def _send_photo(
     image: bytes,
     caption: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    silent: bool = False,
 ):
     """Отправляет фото с подписью. Возвращает сообщение или None при неудаче."""
     for attempt in range(1, 3):
@@ -155,6 +159,7 @@ async def _send_photo(
                 caption=caption or None,
                 parse_mode=ParseMode.HTML if caption else None,
                 reply_markup=reply_markup,
+                disable_notification=silent,
             )
         except RetryAfter as exc:
             wait = float(getattr(exc, "retry_after", 5))
@@ -245,6 +250,31 @@ async def send_digest(
 
     log.info("Дайджест отправлен в %s (%d сообщ.)", chat_id, sent)
     return SendResult(messages=sent, pinned_id=pinned_id)
+
+
+async def send_post(
+    bot: Bot,
+    chat_id: str | int,
+    caption: str,
+    image: bytes | None = None,
+    buttons: Sequence[tuple[str, str]] = (),
+    silent: bool = False,
+):
+    """Отдельный пост о новости: фото с подписью и кнопкой на источник.
+
+    Если фото не ушло, публикуем тот же текст без него — новость важнее
+    картинки. silent=True — без звука у подписчиков: из восьми постов
+    выпуска звенеть стоит только первому.
+    """
+    keyboard = build_keyboard(buttons)
+    message = None
+    if image:
+        message = await _send_photo(
+            bot, chat_id, image, caption, reply_markup=keyboard, silent=silent
+        )
+    if message is None:
+        message = await _send_one(bot, chat_id, caption, reply_markup=keyboard, silent=silent)
+    return message
 
 
 async def send_notice(bot: Bot, chat_ids: Iterable[str | int], text: str) -> None:
