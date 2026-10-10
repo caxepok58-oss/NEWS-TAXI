@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock
 
 import anthropic
+import httpx
 import pytest
 
 import summarizer
@@ -367,7 +368,12 @@ def test_build_digest_runs_copy_check(two_articles):
 # --------------------------------------------------------------------------- #
 
 
-def test_make_client_uses_official_api_by_default(monkeypatch):
+@pytest.fixture
+def no_fallback(monkeypatch):
+    monkeypatch.setattr(summarizer, "FALLBACK_API_KEY", "")
+
+
+def test_make_client_uses_official_api_by_default(monkeypatch, no_fallback):
     """Пустой ANTHROPIC_BASE_URL — обращаемся напрямую к Anthropic."""
     # SDK сам читает одноимённую переменную окружения, поэтому убираем её:
     # иначе тест зависел бы от настроек машины, на которой запущен.
@@ -376,10 +382,27 @@ def test_make_client_uses_official_api_by_default(monkeypatch):
     assert "api.anthropic.com" in str(summarizer.make_client().base_url)
 
 
-def test_make_client_honours_custom_base_url(monkeypatch):
+def test_make_client_ignores_empty_base_url_in_environment(monkeypatch, no_fallback):
+    """Пустая ANTHROPIC_BASE_URL из .env не должна сходить за адрес.
+
+    load_dotenv кладёт пустую строку в окружение, а SDK принимал её за base_url —
+    и каждый запрос падал с «Request URL is missing a protocol».
+    """
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "")
+    monkeypatch.setattr(summarizer, "BASE_URL", "")
+    assert "api.anthropic.com" in str(summarizer.make_client().base_url)
+
+
+def test_make_client_honours_custom_base_url(monkeypatch, no_fallback):
     """Непустой ANTHROPIC_BASE_URL — запросы идут через указанный шлюз."""
     monkeypatch.setattr(summarizer, "BASE_URL", "https://gateway.example/")
     assert "gateway.example" in str(summarizer.make_client().base_url)
+
+
+def test_trailing_v1_is_dropped_from_base_url(monkeypatch, no_fallback):
+    """Шлюзы пишут адрес с /v1, а SDK допишет его сам — вышло бы /v1/v1/messages."""
+    monkeypatch.setattr(summarizer, "BASE_URL", "https://gateway.example/v1/")
+    assert str(summarizer.make_client().base_url).rstrip("/") == "https://gateway.example"
 
 
 @pytest.mark.parametrize("factory", ["select_best", "request_digest"])
@@ -397,3 +420,211 @@ def test_entry_points_build_client_via_make_client(monkeypatch, two_articles, fa
     except summarizer.SummarizerError:
         pass  # пустой items — здесь неважно, проверяем источник клиента
     assert created.messages.create.called
+
+
+# --------------------------------------------------------------------------- #
+# Запасной провайдер
+# --------------------------------------------------------------------------- #
+
+PRIMARY = summarizer.Provider("основной", "https://a.example", "", "model-a")
+SECONDARY = summarizer.Provider("запасной", "https://b.example", "key-b", "model-b")
+
+
+@pytest.fixture(autouse=True)
+def clean_failover_notes():
+    summarizer.take_failover_notes()
+    yield
+    summarizer.take_failover_notes()
+
+
+def _request() -> httpx.Request:
+    return httpx.Request("POST", "https://a.example/v1/messages")
+
+
+def status_error(code: int) -> anthropic.APIStatusError:
+    response = httpx.Response(code, request=_request(), json={"error": {"message": "сбой"}})
+    return anthropic.APIStatusError("сбой", response=response, body=None)
+
+
+def mock_client(*effects):
+    client = MagicMock()
+    client.messages.create.side_effect = list(effects)
+    return client
+
+
+def failover(primary, secondary):
+    return summarizer.FailoverClient([PRIMARY, SECONDARY], clients=[primary, secondary])
+
+
+def test_failover_stays_on_primary_when_it_answers():
+    primary = mock_client(anthropic_message('{"ok": true}'))
+    secondary = mock_client()
+    failover(primary, secondary).messages.create(max_tokens=10, messages=[])
+
+    assert primary.messages.create.call_args.kwargs["model"] == "model-a"
+    secondary.messages.create.assert_not_called()
+    assert summarizer.take_failover_notes() == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        anthropic.APIConnectionError(request=_request()),
+        anthropic.APITimeoutError(request=_request()),
+        status_error(500),
+        status_error(429),
+        status_error(401),
+        status_error(402),
+        status_error(403),
+        status_error(404),
+    ],
+    ids=["connection", "timeout", "500", "429", "401", "402", "403", "404"],
+)
+def test_failover_switches_when_provider_is_down(error):
+    secondary = mock_client(anthropic_message('{"ok": true}'))
+    message = failover(mock_client(error), secondary).messages.create(max_tokens=10, messages=[])
+
+    assert _first_text_of(message) == '{"ok": true}'
+    assert secondary.messages.create.call_args.kwargs["model"] == "model-b"
+    notes = summarizer.take_failover_notes()
+    assert len(notes) == 1 and "a.example" in notes[0] and "b.example" in notes[0]
+
+
+def _first_text_of(message) -> str:
+    return summarizer._first_text(message)
+
+
+def test_failover_switches_on_empty_answer():
+    """Шлюз ответил 200, но пусто — для выпуска это тот же сбой."""
+    secondary = mock_client(anthropic_message('{"ok": true}'))
+    failover(mock_client(anthropic_message("")), secondary).messages.create(messages=[])
+    secondary.messages.create.assert_called_once()
+
+
+def test_failover_does_not_retry_bad_request():
+    """400 — плохой запрос: на другом шлюзе он не станет лучше."""
+    secondary = mock_client()
+    with pytest.raises(anthropic.APIStatusError):
+        failover(mock_client(status_error(400)), secondary).messages.create(messages=[])
+    secondary.messages.create.assert_not_called()
+
+
+def test_failover_returns_refusal_as_is():
+    """Отказ модели — не сбой провайдера: его разбирает _ask."""
+    refusal = anthropic_message("", stop_reason="refusal")
+    secondary = mock_client()
+    assert failover(mock_client(refusal), secondary).messages.create(messages=[]) is refusal
+    secondary.messages.create.assert_not_called()
+
+
+def test_failover_raises_last_error_when_everyone_is_down():
+    last = status_error(503)
+    with pytest.raises(anthropic.APIStatusError) as exc:
+        failover(mock_client(status_error(500)), mock_client(last)).messages.create(messages=[])
+    assert exc.value is last
+    assert summarizer.take_failover_notes() == [], "о переключении сообщаем, только если оно помогло"
+
+
+def test_failover_notes_are_deduplicated():
+    """Отбор, пересказ и переписывание падают одинаково — админу хватит одной строки."""
+    client = failover(
+        mock_client(status_error(402), status_error(402)),
+        mock_client(anthropic_message("{}"), anthropic_message("{}")),
+    )
+    client.messages.create(messages=[])
+    client.messages.create(messages=[])
+    assert len(summarizer.take_failover_notes()) == 1
+    assert summarizer.take_failover_notes() == [], "сообщения забираются один раз"
+
+
+def test_failover_hides_keys_in_error_text(monkeypatch):
+    monkeypatch.setattr(summarizer, "FALLBACK_API_KEY", "sk-secret-fallback-key")
+    error = status_error(401)
+    error.message = "Error code: 401 - неверный ключ sk-secret-fallback-key"
+    assert summarizer._describe(error) == "HTTP 401: неверный ключ ***"
+
+
+def test_request_digest_survives_primary_outage(two_articles):
+    """Сквозной путь: шлюз лежит, выпуск собирается через запасного."""
+    secondary = mock_client(anthropic_message(json.dumps(DIGEST_PAYLOAD, ensure_ascii=False)))
+    client = failover(mock_client(anthropic.APIConnectionError(request=_request())), secondary)
+
+    data = summarizer.request_digest(two_articles, client=client)
+
+    assert data["title"] == "Дайджест дня"
+    kwargs = secondary.messages.create.call_args.kwargs
+    assert kwargs["model"] == "model-b"
+    assert "output_config" in kwargs, "структурированный вывод доходит до запасного"
+
+
+def test_providers_without_fallback(monkeypatch, no_fallback):
+    assert [p.label for p in summarizer.providers()] == ["основной"]
+
+
+def test_providers_with_fallback(monkeypatch):
+    monkeypatch.setattr(summarizer, "FALLBACK_API_KEY", "key-b")
+    monkeypatch.setattr(summarizer, "FALLBACK_BASE_URL", "https://b.example/v1")
+    monkeypatch.setattr(summarizer, "FALLBACK_MODEL", "")
+
+    chain = summarizer.providers()
+
+    assert [p.label for p in chain] == ["основной", "запасной"]
+    assert chain[1].base_url == "https://b.example"
+    assert chain[1].model == summarizer.MODEL, "без своей модели берётся основная"
+    assert isinstance(summarizer.make_client(), summarizer.FailoverClient)
+
+
+# --------------------------------------------------------------------------- #
+# Проверка провайдеров (--check-llm)
+# --------------------------------------------------------------------------- #
+
+
+def _check_with(monkeypatch, *clients):
+    """check_providers с подменёнными клиентами — по одному на провайдера."""
+    pool = iter(clients)
+    monkeypatch.setattr(summarizer, "_build_client", lambda provider: next(pool))
+    return summarizer.check_providers()
+
+
+def test_check_reports_working_provider(monkeypatch, no_fallback):
+    [check] = _check_with(monkeypatch, mock_client(anthropic_message('{"ok": true}')))
+    assert check.ok and check.structured
+    assert check.reported_model == "claude-haiku-4-5-20251001"
+    assert (check.input_tokens, check.output_tokens) == (100, 200)
+
+
+def test_check_notices_missing_structured_output(monkeypatch, no_fallback):
+    unsupported = anthropic.BadRequestError(
+        "unsupported", response=MagicMock(status_code=400, headers={}), body=None
+    )
+    [check] = _check_with(
+        monkeypatch, mock_client(unsupported, anthropic_message('{"ok": true}'))
+    )
+    assert check.ok and not check.structured
+
+
+def test_check_reports_each_provider_separately(monkeypatch):
+    monkeypatch.setattr(summarizer, "FALLBACK_API_KEY", "key-b")
+    results = _check_with(
+        monkeypatch,
+        mock_client(status_error(402), status_error(402)),
+        mock_client(anthropic_message('{"ok": true}')),
+    )
+    assert [r.ok for r in results] == [False, True]
+    assert results[0].error.startswith("HTTP 402")
+
+
+@pytest.mark.parametrize(
+    ("asked", "answered", "differs"),
+    [
+        ("claude-haiku-4-5", "claude-haiku-4-5-20251001", False),
+        ("claude-haiku-4.5", "claude-haiku-4-5-20251001", False),
+        ("claude-haiku-4-5", "claude-sonnet-4-5", True),
+        ("claude-haiku-4-5", "", False),
+    ],
+)
+def test_check_flags_other_model(asked, answered, differs):
+    check = summarizer.ProviderCheck(
+        summarizer.Provider("основной", "", "", asked), reported_model=answered
+    )
+    assert check.model_differs is differs

@@ -4,6 +4,7 @@
     python main.py             # бот с расписанием (ежедневно утром)
     python main.py --once      # собрать и отправить дайджест сейчас, затем выйти
     python main.py --dry-run   # собрать и напечатать в консоль, ничего не отправляя
+    python main.py --check-llm # проверить доступ к модели у всех провайдеров
 """
 
 from __future__ import annotations
@@ -142,6 +143,7 @@ def setup_logging() -> None:
         "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         "%Y-%m-%d %H:%M:%S",
         secrets=(BOT_TOKEN, os.getenv("ANTHROPIC_API_KEY", ""),
+                 os.getenv("ANTHROPIC_FALLBACK_API_KEY", ""),
                  os.getenv("FUSIONBRAIN_API_KEY", ""), os.getenv("FUSIONBRAIN_SECRET_KEY", "")),
     )
     file_handler = RotatingFileHandler(
@@ -171,6 +173,10 @@ def check_config(require_telegram: bool = True) -> None:
         missing.append("TELEGRAM_CHAT_ID")
     if not os.getenv("ANTHROPIC_API_KEY"):
         missing.append("ANTHROPIC_API_KEY")
+    # Без ключа запасной молча не включится — а хозяин будет на него рассчитывать.
+    fallback_set = os.getenv("ANTHROPIC_FALLBACK_BASE_URL") or os.getenv("ANTHROPIC_FALLBACK_MODEL")
+    if fallback_set and not os.getenv("ANTHROPIC_FALLBACK_API_KEY"):
+        missing.append("ANTHROPIC_FALLBACK_API_KEY (задан запасной провайдер без ключа)")
     if missing:
         raise SystemExit(
             "Не заданы переменные окружения: " + ", ".join(missing) + ". См. .env.example"
@@ -330,6 +336,8 @@ async def run_digest(
             log.exception("Непредвиденная ошибка при сборке дайджеста")
             await asyncio.to_thread(_mark_blocking, [], "error", repr(exc))
             return RunResult(False, f"ошибка сборки: {exc}", retryable=True)
+        finally:
+            await report_failover(bot)
 
         if result.feed_alerts and bot is not None:
             lines = "\n".join(
@@ -444,6 +452,8 @@ async def run_breaking(bot: Bot, chat_id: str | int) -> RunResult:
         except Exception as exc:  # noqa: BLE001 - фоновая проверка не критична
             log.exception("Ошибка при поиске срочных новостей")
             return RunResult(False, f"проверка срочных новостей не удалась: {exc}")
+        finally:
+            await report_failover(bot)
 
         if found is None:
             return RunResult(True, "срочных новостей нет")
@@ -596,6 +606,24 @@ async def notify_admins(bot: Bot, text: str) -> None:
         log.warning("ADMIN_USER_IDS не заданы — некому сообщить: %s", text)
         return
     await sender.send_notice(bot, ADMIN_USER_IDS, text)
+
+
+async def report_failover(bot: Bot | None) -> None:
+    """Сообщает админам, что запросы к модели уходили запасному провайдеру.
+
+    Выпуск при этом вышел, но основной провайдер стоит проверить: кончились
+    деньги, отозван ключ или шлюз закрылся — сам он не починится.
+    """
+    notes = summarizer.take_failover_notes()
+    if not notes or bot is None:
+        return
+    try:
+        await notify_admins(
+            bot,
+            "⚠️ " + "\n".join(notes) + "\nПроверьте основного провайдера: ключ, баланс, адрес.",
+        )
+    except Exception:  # noqa: BLE001 - уведомление не должно ронять прогон
+        log.exception("Не удалось сообщить о переключении провайдера")
 
 
 # --------------------------------------------------------------------------- #
@@ -870,6 +898,39 @@ def check_feeds() -> int:
     return 1 if broken else 0
 
 
+def check_llm() -> int:
+    """Пробный запрос к каждому провайдеру модели: адрес, ключ, имя модели, схема.
+
+    Сюрпризы шлюза (лишний /v1, чужие имена моделей, закрытый ключ) лучше
+    увидеть при настройке, чем в 8 утра вместо выпуска.
+    """
+    results = summarizer.check_providers()
+    failed = 0
+    print()
+    for check in results:
+        provider = check.provider
+        print(f"{provider.label.capitalize()}: {provider.host}, модель {provider.model}")
+        if not check.ok:
+            failed += 1
+            print(f"  ОШИБКА: {check.error}")
+            continue
+        print(
+            f"  OK за {check.seconds:.1f} с, ответила {check.reported_model or '—'}, "
+            f"токенов {check.input_tokens} + {check.output_tokens}"
+        )
+        print(
+            "  Структурированный вывод: "
+            + ("да" if check.structured else "нет — бот попросит JSON текстом, это тоже работает")
+        )
+        if check.model_differs:
+            print("  Внимание: шлюз назвал не ту модель, что указана в настройках")
+
+    if len(results) == 1:
+        print("\nЗапасной провайдер не настроен (ANTHROPIC_FALLBACK_API_KEY пуст).")
+    print("\nВсе провайдеры отвечают." if not failed else f"\nНе отвечают: {failed} из {len(results)}.")
+    return 1 if failed else 0
+
+
 def backup_db(destination: str | None = None) -> int:
     """Сохраняет копию базы. Путь по умолчанию — с датой в имени."""
     if not destination:
@@ -921,6 +982,11 @@ def main() -> None:
         "--check-feeds", action="store_true", help="проверить доступность всех лент и выйти"
     )
     parser.add_argument(
+        "--check-llm",
+        action="store_true",
+        help="проверить доступ к модели у основного и запасного провайдера и выйти",
+    )
+    parser.add_argument(
         "--backup",
         nargs="?",
         const="",
@@ -934,6 +1000,9 @@ def main() -> None:
         raise SystemExit(backup_db(args.backup or None))
     if args.check_feeds:
         raise SystemExit(check_feeds())
+    if args.check_llm:
+        check_config(require_telegram=False)
+        raise SystemExit(check_llm())
     if args.dry_run:
         raise SystemExit(asyncio.run(run_once(dry_run=True)))
     if args.once:

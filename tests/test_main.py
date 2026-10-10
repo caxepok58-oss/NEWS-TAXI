@@ -670,3 +670,104 @@ def test_without_admins_only_work_chat_allowed(monkeypatch):
     monkeypatch.setattr(main, "CHAT_ID", "-100")
     assert main._is_allowed(_update(7, "-100"))
     assert not main._is_allowed(_update(7, "-999"))
+
+
+# --------------------------------------------------------------------------- #
+# Запасной провайдер модели
+# --------------------------------------------------------------------------- #
+
+
+def test_check_config_rejects_fallback_without_key(monkeypatch):
+    """Запасной без ключа молча не включится — лучше сказать об этом сразу."""
+    monkeypatch.setenv("ANTHROPIC_FALLBACK_BASE_URL", "https://b.example")
+    monkeypatch.delenv("ANTHROPIC_FALLBACK_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main.check_config(require_telegram=False)
+    assert "ANTHROPIC_FALLBACK_API_KEY" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_failover_is_reported_to_admins(digest, monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+    monkeypatch.setattr(
+        summarizer, "take_failover_notes", lambda: ["Провайдер «основной» не ответил: HTTP 402"]
+    )
+    bot = _bot()
+    with patch.object(main, "_build_digest_blocking", return_value=main.BuildResult(digest)), patch.object(
+        main.sender, "send_digest", new=AsyncMock(return_value=1)
+    ):
+        result = await main.run_digest(bot, "-100")
+
+    assert result.ok
+    texts = [call.kwargs["text"] for call in bot.send_message.await_args_list]
+    assert any("HTTP 402" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_failover_is_reported_even_if_run_failed(monkeypatch):
+    """Запасной помог на отборе, но пересказ упал у обоих — админ должен знать оба факта."""
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+    monkeypatch.setattr(summarizer, "take_failover_notes", lambda: ["переключение"])
+    bot = _bot()
+    with patch.object(
+        main, "_build_digest_blocking", side_effect=summarizer.SummarizerError("оба лежат")
+    ):
+        result = await main.run_digest(bot, "-100")
+
+    assert not result.ok
+    bot.send_message.assert_awaited_once()
+
+
+def _check(ok: bool, **kwargs) -> summarizer.ProviderCheck:
+    provider = summarizer.Provider(
+        kwargs.pop("label", "основной"), "https://gw.example", "", "claude-haiku-4-5"
+    )
+    return summarizer.ProviderCheck(provider, ok=ok, **kwargs)
+
+
+def test_check_llm_success(monkeypatch, capsys):
+    monkeypatch.setattr(
+        summarizer,
+        "check_providers",
+        lambda: [_check(True, reported_model="claude-haiku-4-5-20251001", structured=True)],
+    )
+    assert main.check_llm() == 0
+    out = capsys.readouterr().out
+    assert "gw.example" in out and "claude-haiku-4-5-20251001" in out
+    assert "Запасной провайдер не настроен" in out
+
+
+def test_check_llm_failure_sets_exit_code(monkeypatch, capsys):
+    monkeypatch.setattr(
+        summarizer,
+        "check_providers",
+        lambda: [_check(True), _check(False, label="запасной", error="HTTP 401: неверный ключ")],
+    )
+    assert main.check_llm() == 1
+    assert "HTTP 401: неверный ключ" in capsys.readouterr().out
+
+
+def test_check_llm_warns_about_other_model(monkeypatch, capsys):
+    monkeypatch.setattr(
+        summarizer, "check_providers", lambda: [_check(True, reported_model="claude-sonnet-4-5")]
+    )
+    main.check_llm()
+    assert "не ту модель" in capsys.readouterr().out
+
+
+def test_fallback_key_is_redacted_in_logs(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_FALLBACK_API_KEY", "sk-fallback-secret-123")
+    monkeypatch.setattr(main, "LOG_FILE", str(tmp_path / "bot.log"))
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    try:
+        main.setup_logging()
+        logging.getLogger("t").error("ключ sk-fallback-secret-123 в ошибке")
+        for handler in root.handlers:
+            handler.flush()
+    finally:
+        for handler in root.handlers:
+            handler.close()
+        root.handlers[:] = saved[0]
+        root.setLevel(saved[1])
+    assert "sk-fallback-secret-123" not in (tmp_path / "bot.log").read_text(encoding="utf-8")
