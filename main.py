@@ -55,6 +55,10 @@ log = logging.getLogger("digest")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Тема (топик) в группе с темами, куда публиковать. Пусто — общий поток
+# группы или канал. Узнать id темы: /chatid, отправленная в этой теме.
+_thread = os.getenv("TELEGRAM_THREAD_ID", "").strip()
+THREAD_ID = int(_thread) if _thread.lstrip("-").isdigit() else None
 DIGEST_TIME = os.getenv("DIGEST_TIME", "08:00")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 MIN_ITEMS = int(os.getenv("MIN_ITEMS", "5"))
@@ -333,6 +337,11 @@ class PartialPublish(Exception):
         self.cause = cause
 
 
+def _thread_for(chat_id: str | int) -> int | None:
+    """Тема для публикации: только в рабочем чате, в личке админа тем нет."""
+    return THREAD_ID if str(chat_id) == str(CHAT_ID) else None
+
+
 async def publish(
     bot: Bot,
     chat_id: str | int,
@@ -347,6 +356,7 @@ async def publish(
     оборвалась, PartialPublish несёт уже опубликованные новости: их надо
     пометить, иначе повтор продублирует их в канале.
     """
+    thread_id = _thread_for(chat_id)
     if not _separate_posts(digest):
         previous_pin = await asyncio.to_thread(_pinned_id) if pin else None
         sent = await sender.send_digest(
@@ -357,6 +367,7 @@ async def publish(
             buttons=digest.buttons,
             pin=pin,
             unpin=previous_pin,
+            thread_id=thread_id,
         )
         if pin and getattr(sent, "pinned_id", None):
             await asyncio.to_thread(_remember_pinned, sent.pinned_id)
@@ -369,7 +380,13 @@ async def publish(
         caption, buttons = summarizer.render_item(item)
         try:
             await sender.send_post(
-                bot, chat_id, caption, image=item.image, buttons=buttons, silent=index > 0
+                bot,
+                chat_id,
+                caption,
+                image=item.image,
+                buttons=buttons,
+                silent=index > 0,
+                thread_id=thread_id,
             )
         except Exception as exc:  # noqa: BLE001 - отдаём наверх вместе с ушедшими
             raise PartialPublish(published, exc) from exc
@@ -738,7 +755,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    await update.message.reply_text(f"chat_id: {chat.id}")
+    message = update.message
+    text = f"TELEGRAM_CHAT_ID={chat.id}"
+    # В группе с темами команда, отправленная внутри темы, несёт её id.
+    if message is not None and message.is_topic_message and message.message_thread_id:
+        text += f"\nTELEGRAM_THREAD_ID={message.message_thread_id}"
+    elif getattr(chat, "is_forum", False):
+        text += "\nЭто общая тема. Чтобы публиковать в другую, отправьте /chatid в ней."
+    await message.reply_text(text)
 
 
 def _next_run_text(context: ContextTypes.DEFAULT_TYPE) -> str:

@@ -891,3 +891,70 @@ def test_prepare_images_attaches_photo_to_each_item(separate, three_news, monkey
     monkeypatch.setattr(main.imagegen, "news_images", lambda items: [b"A", b"B", None])
     assert main._prepare_images(three_news) is None, "общая обложка в этом режиме не нужна"
     assert [i.image for i in three_news.items] == [b"A", b"B", None]
+
+
+# --------------------------------------------------------------------------- #
+# Публикация в тему группы
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_posts_go_to_configured_topic(separate, three_news, monkeypatch):
+    monkeypatch.setattr(main, "CHAT_ID", "-100")
+    monkeypatch.setattr(main, "THREAD_ID", 7)
+    with patch.object(main.sender, "send_post", new=AsyncMock()) as post:
+        await main.publish(_bot(), "-100", three_news, None)
+    assert {c.kwargs["thread_id"] for c in post.await_args_list} == {7}
+
+
+@pytest.mark.asyncio
+async def test_digest_mode_goes_to_topic_too(monkeypatch, digest):
+    monkeypatch.setattr(main, "CHAT_ID", "-100")
+    monkeypatch.setattr(main, "THREAD_ID", 7)
+    with patch.object(main.sender, "send_digest", new=AsyncMock(return_value=1)) as send:
+        await main.publish(_bot(), "-100", digest, None)
+    assert send.await_args.kwargs["thread_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_preview_to_admin_ignores_topic(separate, three_news, monkeypatch):
+    """В личке админа тем нет — с id темы Telegram отклонил бы сообщение."""
+    monkeypatch.setattr(main, "CHAT_ID", "-100")
+    monkeypatch.setattr(main, "THREAD_ID", 7)
+    monkeypatch.setattr(main, "ADMIN_USER_IDS", {42})
+    with patch.object(main.sender, "send_post", new=AsyncMock()) as post:
+        key = await main.send_preview(_bot(), three_news, None)
+    assert {c.kwargs["thread_id"] for c in post.await_args_list} == {None}
+    main._pending.pop(key, None)
+
+
+def _chatid_update(*, topic: int | None = None, forum: bool = False):
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    message.is_topic_message = topic is not None
+    message.message_thread_id = topic
+    chat = MagicMock(id=-1009876543210, is_forum=forum)
+    return MagicMock(effective_chat=chat, message=message), message
+
+
+@pytest.mark.asyncio
+async def test_chatid_shows_topic_id_inside_topic():
+    update, message = _chatid_update(topic=15, forum=True)
+    await main.cmd_chatid(update, MagicMock())
+    text = message.reply_text.await_args.args[0]
+    assert "TELEGRAM_CHAT_ID=-1009876543210" in text and "TELEGRAM_THREAD_ID=15" in text
+
+
+@pytest.mark.asyncio
+async def test_chatid_in_general_topic_explains_what_to_do():
+    update, message = _chatid_update(forum=True)
+    await main.cmd_chatid(update, MagicMock())
+    text = message.reply_text.await_args.args[0]
+    assert "TELEGRAM_THREAD_ID" not in text and "общая тема" in text
+
+
+@pytest.mark.asyncio
+async def test_chatid_in_plain_group():
+    update, message = _chatid_update()
+    await main.cmd_chatid(update, MagicMock())
+    assert message.reply_text.await_args.args[0] == "TELEGRAM_CHAT_ID=-1009876543210"

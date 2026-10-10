@@ -280,3 +280,20 @@ async def test_send_post_without_image_sends_text():
     bot.send_message = AsyncMock(return_value=MagicMock(message_id=3))
     await sender.send_post(bot, "-100", "текст")
     bot.send_photo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_post_passes_topic():
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(return_value=MagicMock(message_id=1))
+    await sender.send_post(bot, "-100", "текст", image=b"IMG", thread_id=7)
+    assert bot.send_photo.await_args.kwargs["message_thread_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_send_digest_passes_topic_to_every_message():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    await sender.send_digest(bot, "-100", "абзац\n\n" * 700, thread_id=7)
+    assert bot.send_message.await_count > 1
+    assert {c.kwargs["message_thread_id"] for c in bot.send_message.await_args_list} == {7}
